@@ -17,13 +17,32 @@ Timbrel is an open-source, real-time voice changer for Windows, for gaming and o
 | Decision | Choice | Notes |
 | --- | --- | --- |
 | Audio I/O | `sounddevice` (PortAudio, WASAPI host API) | Full-duplex stream, 48 kHz, float32, mono |
-| DSP | `numpy`, `scipy.signal`, custom effects | See licensing note on `pedalboard` below |
+| DSP | `numpy`, `scipy.signal`, custom effects | Own pitch shifter, no `pedalboard` (see Decisions log) |
 | UI | PySide6 (LGPL) | Single window + system tray |
 | Hotkeys | `keyboard` or `pynput` | Global hotkeys that work while a game is focused |
 | Config | JSON in `%APPDATA%\Timbrel\` | Settings + user presets |
 | Packaging | PyInstaller, one-folder build, zipped | No installer in v1 |
 | Virtual mic | VB-Audio Virtual Cable (user installs it) | Donationware; do NOT bundle or redistribute it, link to it |
-| License | GPL-3.0 if we use `pedalboard`; otherwise MIT | `pedalboard` is GPL-3.0, which makes the whole app GPL. Decide in M1 and set LICENSE accordingly |
+| License | MIT | Decided in M1: own pitch shifter instead of GPL-3.0 `pedalboard` (see Decisions log) |
+
+## Decisions log
+
+### M1: Pitch shift is our own WSOLA-style delay line; license is MIT
+- **Choice:** own implementation (`core/effects/pitch.py`), not `pedalboard`. `pedalboard` is GPL-3.0 and would make the whole app GPL; our own keeps the project MIT.
+- **Algorithm:** two delay-line taps reading at `ratio` times real speed, crossfaded with sin² windows. When a tap reaches the end of its grain it jumps about one window, landing where normalised cross-correlation says its waveform lines up with the other tap, so the crossfade is in phase (WSOLA-style). A phase vocoder was rejected: it needs FFT frames of 20–40 ms plus overlap, blowing the latency budget.
+- **Numbers:** 20 ms window, ~10 ms added delay, ~1% of one core. Harmonic-to-noise ratio of shifted harmonic tones (75–300 Hz, ±12 semitones) is 24–60 dB (mean ~50 dB); a fixed-jump delay line measured ~2–5 dB on the same test.
+- **Trade-off:** formants move with pitch (chipmunk/deep sound). Formant correction is the separate P1 formant-shift effect.
+
+### M1: Latency measurements
+`scripts/latency_test.py` plays clicks into CABLE Input and records them from CABLE Output through a full-duplex stream like the engine's. This loop ≈ what Timbrel adds (our input buffering + our output buffering + VB-Cable's internal buffer), excluding effect delay.
+
+| WASAPI mode (capture / playback) | Measured round trip |
+| --- | --- |
+| shared / shared | 93–117 ms |
+| shared / exclusive (current: cable playback exclusive) | 67–78 ms |
+| exclusive / exclusive | 51–55 ms |
+
+PortAudio's reported latency is not reliable here (it reported 49 ms for the 93–117 ms case and 88 ms for the 51 ms case). With the pitch shifter's ~10 ms, the current total is ~80 ms, over the 40 ms target; see the M1 status notes.
 
 ## Goals (v1)
 

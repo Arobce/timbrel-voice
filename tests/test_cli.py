@@ -1,6 +1,13 @@
 import pytest
 
-from timbrel.__main__ import build_parser, format_device_list, main
+from timbrel.__main__ import (
+    build_chain,
+    build_parser,
+    format_device_list,
+    main,
+    parse_effect,
+    parse_params,
+)
 from timbrel.platform import windows
 
 
@@ -53,3 +60,43 @@ def test_info_flags_exit_cleanly(flag):
     with pytest.raises(SystemExit) as exc:
         main([flag])
     assert exc.value.code == 0
+
+
+def test_parse_params():
+    assert parse_params("semitones=-5, mix=0.5") == {"semitones": -5.0, "mix": 0.5}
+    assert parse_params("") == {}
+
+
+@pytest.mark.parametrize("text", ["semitones", "semitones=low"])
+def test_parse_params_rejects_bad_input(text):
+    with pytest.raises(ValueError):
+        parse_params(text)
+
+
+def test_parse_effect_sets_params():
+    effect = parse_effect("pitch:semitones=-5", 48000, 256)
+    assert effect.name == "pitch"
+    assert effect.params["semitones"] == -5.0
+
+
+def test_parse_effect_unknown_name():
+    with pytest.raises(ValueError, match="unknown effect"):
+        parse_effect("vocoder", 48000, 256)
+
+
+def test_build_chain_orders_effects_and_sets_gate():
+    chain = build_chain(["robot", "pitch:semitones=3"], "threshold_db=-40", 48000, 256)
+    assert [fx.name for fx in chain.effects] == ["robot", "pitch"]
+    assert chain.gate.params["threshold_db"] == -40.0
+
+
+def test_list_effects_flag(capsys):
+    assert main(["--list-effects"]) == 0
+    out = capsys.readouterr().out
+    assert "semitones" in out
+    assert "threshold_db" in out
+
+
+def test_bad_effect_exits_with_error(fake_devices, capsys):
+    assert main(["--effect", "pitch:semitones=abc"]) == 2
+    assert "not a number" in capsys.readouterr().err
