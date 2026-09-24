@@ -85,6 +85,11 @@ def wasapi_devices(devices: DeviceList, hostapis: DeviceList) -> WasapiDevices:
     )
 
 
+def is_virtual_cable(device: Device) -> bool:
+    """True for any VB-Audio Virtual Cable endpoint, input or output."""
+    return "vb-audio" in device.name.lower()
+
+
 def find_cable(wasapi: WasapiDevices) -> Device | None:
     """Return VB-Cable's playback endpoint ("CABLE Input ..."), if installed."""
     for device in wasapi.of("output"):
@@ -93,29 +98,46 @@ def find_cable(wasapi: WasapiDevices) -> Device | None:
     return None
 
 
-def resolve_device(spec: str | None, direction: Direction, wasapi: WasapiDevices) -> Device:
-    """Pick a WASAPI device from a CLI spec: an index, a name fragment, or None.
+def check_route(mic: Device, out: Device) -> None:
+    """Refuse cable -> cable, which would feed our output back into our input."""
+    if is_virtual_cable(mic) and is_virtual_cable(out):
+        raise DeviceError(
+            f"Input {mic.name!r} is the virtual cable itself, which would create a "
+            "feedback loop. Choose your real microphone with --input."
+        )
 
-    With no spec, the output defaults to VB-Cable and the input to the system
-    default microphone.
+
+def default_device(direction: Direction, wasapi: WasapiDevices) -> Device:
+    """The output defaults to VB-Cable and the input to the system default mic.
+
+    VB-Cable's installer often makes "CABLE Output" the default mic; in that
+    case the first real microphone is used instead.
     """
-    candidates = wasapi.of(direction)
-
-    if spec is None:
-        if direction == "output":
-            cable = find_cable(wasapi)
-            if cable is None:
-                raise DeviceError(
-                    "VB-Audio Virtual Cable not found. Install it from "
-                    f"{VB_CABLE_URL} or choose an output with --output."
-                )
-            return cable
-        default = wasapi.default("input")
-        device = wasapi.by_index(default) if default is not None else None
-        if device is None or not device.supports("input"):
-            raise DeviceError("No default input device; choose one with --input.")
+    if direction == "output":
+        cable = find_cable(wasapi)
+        if cable is None:
+            raise DeviceError(
+                "VB-Audio Virtual Cable not found. Install it from "
+                f"{VB_CABLE_URL} or choose an output with --output."
+            )
+        return cable
+    default = wasapi.default("input")
+    device = wasapi.by_index(default) if default is not None else None
+    if device is not None and device.supports("input") and not is_virtual_cable(device):
         return device
+    real_mics = [d for d in wasapi.of("input") if not is_virtual_cable(d)]
+    if not real_mics:
+        raise DeviceError("No microphone found; choose one with --input.")
+    return real_mics[0]
 
+
+def resolve_device(spec: str | None, direction: Direction, wasapi: WasapiDevices) -> Device:
+    """Pick a WASAPI device from a CLI spec: an index, a name fragment, or None
+    (see ``default_device``)."""
+    if spec is None:
+        return default_device(direction, wasapi)
+
+    candidates = wasapi.of(direction)
     spec = spec.strip()
     if spec.isdigit():
         device = wasapi.by_index(int(spec))

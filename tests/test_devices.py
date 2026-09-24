@@ -1,7 +1,13 @@
 import pytest
 
 from conftest import DEVICES, HOSTAPIS
-from timbrel.platform.windows import DeviceError, find_cable, resolve_device, wasapi_devices
+from timbrel.platform.windows import (
+    DeviceError,
+    check_route,
+    find_cable,
+    resolve_device,
+    wasapi_devices,
+)
 
 
 def test_only_wasapi_devices_are_listed(wasapi):
@@ -34,6 +40,23 @@ def test_default_output_without_cable_explains_install(wasapi_no_cable):
 
 def test_default_input_is_system_default(wasapi):
     assert resolve_device(None, "input", wasapi).index == 3
+
+
+def test_default_input_skips_cable_when_it_is_system_default():
+    hostapis = [HOSTAPIS[0], {**HOSTAPIS[1], "default_input_device": 6}]
+    wasapi = wasapi_devices(DEVICES, hostapis)
+    assert resolve_device(None, "input", wasapi).index == 2
+
+
+def test_cable_to_cable_route_is_refused(wasapi):
+    mic = resolve_device("cable output", "input", wasapi)
+    out = resolve_device(None, "output", wasapi)
+    with pytest.raises(DeviceError, match="feedback loop"):
+        check_route(mic, out)
+
+
+def test_mic_to_cable_route_is_allowed(wasapi):
+    check_route(resolve_device(None, "input", wasapi), resolve_device(None, "output", wasapi))
 
 
 def test_resolve_by_index(wasapi):

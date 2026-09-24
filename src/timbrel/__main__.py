@@ -72,6 +72,7 @@ def run(input_spec: str | None, output_spec: str | None, block_size: int) -> int
     wasapi = windows.query_wasapi_devices()
     mic = windows.resolve_device(input_spec, "input", wasapi)
     out = windows.resolve_device(output_spec, "output", wasapi)
+    windows.check_route(mic, out)
 
     config = EngineConfig(
         input_device=mic.index,
