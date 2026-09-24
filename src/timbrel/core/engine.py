@@ -26,7 +26,9 @@ class EngineConfig:
     sample_rate: int = DEFAULT_SAMPLE_RATE
     block_size: int = DEFAULT_BLOCK_SIZE
     output_channels: int = 2
-    extra_settings: Any = None
+    # Host-API specific settings (e.g. sd.WasapiSettings) for each direction.
+    input_settings: Any = None
+    output_settings: Any = None
 
     def __post_init__(self) -> None:
         if not MIN_BLOCK_SIZE <= self.block_size <= MAX_BLOCK_SIZE:
@@ -107,7 +109,7 @@ class Engine:
             dtype="float32",
             channels=(1, cfg.output_channels),
             latency="low",
-            extra_settings=(cfg.extra_settings, cfg.extra_settings),
+            extra_settings=(cfg.input_settings, cfg.output_settings),
             callback=self._callback,
         )
         stream.start()

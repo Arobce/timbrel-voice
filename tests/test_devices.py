@@ -1,4 +1,5 @@
 import pytest
+import sounddevice as sd
 
 from conftest import DEVICES, HOSTAPIS
 from timbrel.platform.windows import (
@@ -6,6 +7,7 @@ from timbrel.platform.windows import (
     check_route,
     find_cable,
     resolve_device,
+    stream_settings,
     wasapi_devices,
 )
 
@@ -96,3 +98,18 @@ def test_exact_name_wins_over_fragment(wasapi):
 def test_unknown_name_raises(wasapi):
     with pytest.raises(DeviceError, match="No WASAPI output"):
         resolve_device("nonexistent", "output", wasapi)
+
+
+def _is_exclusive(settings) -> bool:
+    return bool(settings._streaminfo.flags & sd._lib.paWinWasapiExclusive)
+
+
+def test_only_cable_playback_is_exclusive(wasapi):
+    cable = resolve_device(None, "output", wasapi)
+    speakers = resolve_device("realtek", "output", wasapi)
+    mic = resolve_device(None, "input", wasapi)
+    cable_capture = resolve_device("cable output", "input", wasapi)
+    assert _is_exclusive(stream_settings(cable))
+    assert not _is_exclusive(stream_settings(speakers))
+    assert not _is_exclusive(stream_settings(mic))
+    assert not _is_exclusive(stream_settings(cable_capture))

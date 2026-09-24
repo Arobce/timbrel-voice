@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 import time
 from collections.abc import Sequence
@@ -80,10 +81,17 @@ def run(input_spec: str | None, output_spec: str | None, block_size: int) -> int
         sample_rate=DEFAULT_SAMPLE_RATE,
         block_size=block_size,
         output_channels=min(2, out.max_output_channels),
-        extra_settings=windows.stream_settings(),
+        input_settings=windows.stream_settings(mic),
+        output_settings=windows.stream_settings(out),
     )
     engine = Engine(config)
-    engine.start()
+    try:
+        engine.start()
+    except sd.PortAudioError:
+        # Exclusive mode can be refused (device busy, format unsupported).
+        config = dataclasses.replace(config, output_settings=windows.shared_settings())
+        engine = Engine(config)
+        engine.start()
     print(f"Input:  [{mic.index}] {mic.name}")
     print(f"Output: [{out.index}] {out.name}")
     print(

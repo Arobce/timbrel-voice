@@ -168,7 +168,19 @@ def query_wasapi_devices() -> WasapiDevices:
     return wasapi_devices(sd.query_devices(), sd.query_hostapis())
 
 
-def stream_settings() -> sd.WasapiSettings:
-    """Shared-mode WASAPI, letting Windows convert rate/channels when the
-    device's mix format differs from our 48 kHz mono/stereo stream."""
+def stream_settings(device: Device | None = None) -> sd.WasapiSettings:
+    """WASAPI settings for a device.
+
+    VB-Cable's playback endpoint is opened in exclusive mode: only Timbrel
+    writes to it, and exclusive mode measures ~30 ms lower round-trip latency
+    than shared mode. Everything else (mics, speakers) stays in shared mode so
+    other apps can keep using it, with Windows converting rate/channels when
+    the device's mix format differs from our 48 kHz stream.
+    """
+    if device is not None and is_virtual_cable(device) and device.supports("output"):
+        return sd.WasapiSettings(exclusive=True)
+    return shared_settings()
+
+
+def shared_settings() -> sd.WasapiSettings:
     return sd.WasapiSettings(auto_convert=True)
