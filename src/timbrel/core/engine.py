@@ -13,6 +13,8 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 
+from timbrel.core.chain import EffectChain
+
 DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_BLOCK_SIZE = 256
 MIN_BLOCK_SIZE = 128
@@ -67,8 +69,9 @@ class StreamStats:
 class Engine:
     """Mic -> (processing) -> output device, as one full-duplex stream."""
 
-    def __init__(self, config: EngineConfig) -> None:
+    def __init__(self, config: EngineConfig, chain: EffectChain | None = None) -> None:
         self.config = config
+        self.chain = chain
         self.stats = StreamStats()
         self._mono = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
         self._stream: sd.Stream | None = None
@@ -95,7 +98,8 @@ class Engine:
 
         mono = self._mono[:frames]
         np.copyto(mono, indata[:frames, 0])
-        # Effects chain plugs in here (M1).
+        if self.chain is not None:
+            mono = self.chain.process(mono)
         outdata[:frames] = mono[:, np.newaxis]
 
     def start(self) -> None:
@@ -127,11 +131,17 @@ class Engine:
 
     @property
     def latency_ms(self) -> float | None:
-        """Input + output latency reported by PortAudio, in milliseconds."""
+        """Stream latency reported by PortAudio plus effect delay, in ms.
+
+        PortAudio's figure is an estimate; scripts/latency_test.py measures
+        the real round trip.
+        """
         if self._stream is None:
             return None
         input_latency, output_latency = self._stream.latency
-        return (input_latency + output_latency) * 1000.0
+        effect_samples = self.chain.latency_samples if self.chain is not None else 0
+        effect_latency = effect_samples / self.config.sample_rate
+        return (input_latency + output_latency + effect_latency) * 1000.0
 
     def __enter__(self) -> Engine:
         self.start()

@@ -9,6 +9,7 @@ description = "Real-time voice changer for Windows games and meetings"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
+    "scipy>=1.11",
     "sounddevice>=0.4.6",
 ]
 

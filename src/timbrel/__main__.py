@@ -11,6 +11,8 @@ from collections.abc import Sequence
 import sounddevice as sd
 
 from timbrel import __version__
+from timbrel.core.chain import EffectChain
+from timbrel.core.effects import EFFECTS, Effect, NoiseGate
 from timbrel.core.engine import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_SAMPLE_RATE,
@@ -46,7 +48,69 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=f"samples per block, {MIN_BLOCK_SIZE}-{MAX_BLOCK_SIZE} (default: %(default)s)",
     )
+    parser.add_argument(
+        "--effect",
+        action="append",
+        default=[],
+        metavar="NAME[:PARAM=VALUE,...]",
+        help="add an effect, e.g. --effect pitch:semitones=-5 (repeatable, applied in order)",
+    )
+    parser.add_argument(
+        "--gate",
+        metavar="PARAM=VALUE,...",
+        help="noise gate settings, e.g. --gate threshold_db=-45,release_ms=200",
+    )
+    parser.add_argument(
+        "--list-effects", action="store_true", help="list effects and their parameters and exit"
+    )
     return parser
+
+
+def parse_params(text: str) -> dict[str, float]:
+    """Parse "a=1,b=-2.5" into {"a": 1.0, "b": -2.5}."""
+    params: dict[str, float] = {}
+    for item in filter(None, (part.strip() for part in text.split(","))):
+        name, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(f"expected PARAM=VALUE, got {item!r}")
+        try:
+            params[name.strip()] = float(value)
+        except ValueError:
+            raise ValueError(f"{name.strip()}: {value!r} is not a number") from None
+    return params
+
+
+def parse_effect(spec: str, sample_rate: int, block_size: int) -> Effect:
+    name, _, param_text = spec.partition(":")
+    cls = EFFECTS.get(name.strip().lower())
+    if cls is None:
+        raise ValueError(f"unknown effect {name!r}; choose from {', '.join(EFFECTS)}")
+    effect = cls(sample_rate, block_size)
+    effect.set_params(**parse_params(param_text))
+    return effect
+
+
+def build_chain(
+    effect_specs: Sequence[str], gate_spec: str | None, sample_rate: int, block_size: int
+) -> EffectChain:
+    effects = [parse_effect(spec, sample_rate, block_size) for spec in effect_specs]
+    chain = EffectChain(sample_rate, block_size, effects)
+    if gate_spec:
+        chain.gate.set_params(**parse_params(gate_spec))
+    return chain
+
+
+def format_effect_list() -> str:
+    lines = ["Effects (chain order: gate -> your --effect list -> limiter):"]
+    for cls in (NoiseGate, *EFFECTS.values()):
+        label = f"{cls.name} (set with --gate)" if cls is NoiseGate else cls.name
+        lines.append(f"  {label}")
+        for pname, spec in cls.PARAMS.items():
+            unit = f" {spec.unit}" if spec.unit else ""
+            lines.append(
+                f"      {pname:<14} {spec.min:g} to {spec.max:g}{unit} (default {spec.default:g})"
+            )
+    return "\n".join(lines)
 
 
 def format_device_list(wasapi: windows.WasapiDevices) -> str:
@@ -69,10 +133,12 @@ def format_device_list(wasapi: windows.WasapiDevices) -> str:
     return "\n".join(lines).rstrip()
 
 
-def run(input_spec: str | None, output_spec: str | None, block_size: int) -> int:
+def run(args: argparse.Namespace) -> int:
+    block_size = args.block_size
+    chain = build_chain(args.effect, args.gate, DEFAULT_SAMPLE_RATE, block_size)
     wasapi = windows.query_wasapi_devices()
-    mic = windows.resolve_device(input_spec, "input", wasapi)
-    out = windows.resolve_device(output_spec, "output", wasapi)
+    mic = windows.resolve_device(args.input, "input", wasapi)
+    out = windows.resolve_device(args.output, "output", wasapi)
     windows.check_route(mic, out)
 
     config = EngineConfig(
@@ -84,16 +150,18 @@ def run(input_spec: str | None, output_spec: str | None, block_size: int) -> int
         input_settings=windows.stream_settings(mic),
         output_settings=windows.stream_settings(out),
     )
-    engine = Engine(config)
+    engine = Engine(config, chain)
     try:
         engine.start()
     except sd.PortAudioError:
         # Exclusive mode can be refused (device busy, format unsupported).
         config = dataclasses.replace(config, output_settings=windows.shared_settings())
-        engine = Engine(config)
+        engine = Engine(config, chain)
         engine.start()
     print(f"Input:  [{mic.index}] {mic.name}")
     print(f"Output: [{out.index}] {out.name}")
+    names = " -> ".join(["gate", *(fx.name for fx in chain.effects), "limiter"])
+    print(f"Chain:  {names}")
     print(
         f"{config.sample_rate} Hz, block {block_size} "
         f"({block_size / config.sample_rate * 1000:.1f} ms), "
@@ -130,7 +198,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.list_devices:
             print(format_device_list(windows.query_wasapi_devices()))
             return 0
-        return run(args.input, args.output, args.block_size)
+        if args.list_effects:
+            print(format_effect_list())
+            return 0
+        return run(args)
     except (windows.DeviceError, ValueError, sd.PortAudioError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
