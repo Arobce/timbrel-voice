@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="noise gate settings, e.g. --gate threshold_db=-45,release_ms=200",
     )
     parser.add_argument(
+        "--exclusive-mic",
+        action="store_true",
+        help="open the mic in exclusive mode: ~18 ms lower latency, "
+        "but other apps can't use the mic while Timbrel runs",
+    )
+    parser.add_argument(
         "--list-effects", action="store_true", help="list effects and their parameters and exit"
     )
     return parser
@@ -133,6 +139,31 @@ def format_device_list(wasapi: windows.WasapiDevices) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _is_exclusive(settings: sd.WasapiSettings | None) -> bool:
+    return settings is not None and bool(settings._streaminfo.flags & sd._lib.paWinWasapiExclusive)
+
+
+def start_engine(config: EngineConfig, chain: EffectChain) -> tuple[Engine, EngineConfig]:
+    """Start the engine, falling back to shared mode on each side that refuses
+    exclusive access (device busy or format unsupported)."""
+    shared = windows.shared_settings()
+    attempts = [
+        config,
+        dataclasses.replace(config, input_settings=shared),
+        dataclasses.replace(config, input_settings=shared, output_settings=shared),
+    ]
+    for attempt in attempts[:-1]:
+        engine = Engine(attempt, chain)
+        try:
+            engine.start()
+            return engine, attempt
+        except sd.PortAudioError:
+            pass
+    engine = Engine(attempts[-1], chain)
+    engine.start()
+    return engine, attempts[-1]
+
+
 def run(args: argparse.Namespace) -> int:
     block_size = args.block_size
     chain = build_chain(args.effect, args.gate, DEFAULT_SAMPLE_RATE, block_size)
@@ -147,19 +178,20 @@ def run(args: argparse.Namespace) -> int:
         sample_rate=DEFAULT_SAMPLE_RATE,
         block_size=block_size,
         output_channels=min(2, out.max_output_channels),
-        input_settings=windows.stream_settings(mic),
+        input_settings=windows.stream_settings(mic, exclusive=args.exclusive_mic),
         output_settings=windows.stream_settings(out),
     )
-    engine = Engine(config, chain)
-    try:
-        engine.start()
-    except sd.PortAudioError:
-        # Exclusive mode can be refused (device busy, format unsupported).
-        config = dataclasses.replace(config, output_settings=windows.shared_settings())
-        engine = Engine(config, chain)
-        engine.start()
-    print(f"Input:  [{mic.index}] {mic.name}")
-    print(f"Output: [{out.index}] {out.name}")
+    engine, config = start_engine(config, chain)
+    mic_mode = (
+        "exclusive"
+        if config.input_settings is not None and _is_exclusive(config.input_settings)
+        else "shared"
+    )
+    out_mode = "exclusive" if _is_exclusive(config.output_settings) else "shared"
+    if args.exclusive_mic and mic_mode == "shared":
+        print("note: the mic refused exclusive mode (busy or format unsupported); using shared.")
+    print(f"Input:  [{mic.index}] {mic.name} ({mic_mode})")
+    print(f"Output: [{out.index}] {out.name} ({out_mode})")
     names = " -> ".join(["gate", *(fx.name for fx in chain.effects), "limiter"])
     print(f"Chain:  {names}")
     print(

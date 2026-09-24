@@ -28,7 +28,11 @@ CLICK_SAMPLES = 48  # 1 ms
 
 
 def measure(
-    input_device: int, output_device: int, block_size: int, clicks: int
+    input_device: int,
+    output_device: int,
+    block_size: int,
+    clicks: int,
+    exclusive_capture: bool = False,
 ) -> tuple[list[float], tuple[float, float]]:
     sr = DEFAULT_SAMPLE_RATE
     interval = int(CLICK_INTERVAL_S * sr)
@@ -64,7 +68,8 @@ def measure(
         channels=(1, 2),
         latency="low",
         extra_settings=(
-            windows.shared_settings(),  # capture like Discord would: shared mode
+            # Capture stands in for the mic side of the engine.
+            windows.stream_settings(exclusive=exclusive_capture),
             windows.stream_settings(out_dev),  # same mode the engine uses
         ),
         callback=callback,
@@ -89,6 +94,11 @@ def main() -> int:
     parser.add_argument("--output", help="loopback playback device (default: VB-Cable)")
     parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     parser.add_argument("--clicks", type=int, default=8)
+    parser.add_argument(
+        "--exclusive-capture",
+        action="store_true",
+        help="capture in exclusive mode, like timbrel --exclusive-mic",
+    )
     args = parser.parse_args()
 
     wasapi = windows.query_wasapi_devices()
@@ -100,7 +110,9 @@ def main() -> int:
         return 2
 
     print(f"Loopback: [{out.index}] {out.name} -> [{mic.index}] {mic.name}")
-    delays, reported = measure(mic.index, out.index, args.block_size, args.clicks)
+    delays, reported = measure(
+        mic.index, out.index, args.block_size, args.clicks, args.exclusive_capture
+    )
     print(
         f"Block {args.block_size}: PortAudio reports {reported[0] * 1000:.1f} ms in + "
         f"{reported[1] * 1000:.1f} ms out = {sum(reported) * 1000:.1f} ms"
