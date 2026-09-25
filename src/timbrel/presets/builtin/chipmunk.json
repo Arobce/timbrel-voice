@@ -1,0 +1,8 @@
+{
+  "name": "Chipmunk",
+  "description": "High and squeaky.",
+  "gate": {"threshold_db": -50, "release_ms": 150},
+  "effects": [
+    {"type": "pitch", "params": {"semitones": 8}}
+  ]
+}

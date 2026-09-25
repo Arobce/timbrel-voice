@@ -1,0 +1,9 @@
+{
+  "name": "Clean",
+  "description": "Your real voice, just clearer. For meetings: gentle gate, rumble cut, a little presence, light compression.",
+  "gate": {"threshold_db": -50, "release_ms": 300},
+  "effects": [
+    {"type": "eq", "params": {"low_cut_hz": 80, "presence_db": 2}},
+    {"type": "compressor", "params": {"threshold_db": -24, "ratio": 3}}
+  ]
+}

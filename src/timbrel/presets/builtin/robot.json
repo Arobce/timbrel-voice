@@ -1,0 +1,9 @@
+{
+  "name": "Robot",
+  "description": "Metallic ring-modulated robot voice.",
+  "gate": {"threshold_db": -48, "release_ms": 120},
+  "effects": [
+    {"type": "robot", "params": {"freq_hz": 70, "mix": 1.0}},
+    {"type": "eq", "params": {"low_cut_hz": 120, "presence_db": 2}}
+  ]
+}

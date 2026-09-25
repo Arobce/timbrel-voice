@@ -1,0 +1,8 @@
+{
+  "name": "Radio",
+  "description": "Walkie-talkie: narrow band, a bit of crunch and static.",
+  "gate": {"threshold_db": -48, "release_ms": 120},
+  "effects": [
+    {"type": "radio", "params": {"drive": 0.5, "noise": 0.2}}
+  ]
+}

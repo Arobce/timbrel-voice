@@ -1,0 +1,9 @@
+{
+  "name": "Deep",
+  "description": "A lower, bigger voice.",
+  "gate": {"threshold_db": -50, "release_ms": 200},
+  "effects": [
+    {"type": "pitch", "params": {"semitones": -4}},
+    {"type": "eq", "params": {"low_cut_hz": 60, "presence_db": 1}}
+  ]
+}
