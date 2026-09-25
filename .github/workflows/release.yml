@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev,build]"
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $version = (python -c "import timbrel; print(timbrel.__version__)").Trim()
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match timbrel.__version__ ($version)"
+          }
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build
+        shell: pwsh
+        run: ./scripts/build.ps1 -Python python
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist/Timbrel-*-win64.zip | Select-Object -First 1
+          gh release create "${{ github.ref_name }}" $zip.FullName `
+            --title "Timbrel ${{ github.ref_name }}" `
+            --notes "Windows 10/11 (x64). Requires VB-Audio Virtual Cable: https://vb-audio.com/Cable/ . See the README for setup. Unsigned build: in SmartScreen click More info, then Run anyway."

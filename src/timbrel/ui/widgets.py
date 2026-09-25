@@ -113,7 +113,7 @@ class ParamSlider(QWidget):
     def _update_readout(self) -> None:
         value = self.value()
         span = abs(self.spec.max - self.spec.min)
-        digits = 0 if span >= 100 else 1 if span >= 10 else 2
+        digits = 0 if span >= 100 else 1 if span >= 5 else 2
         unit = self.spec.unit
         sep = "" if unit.startswith(":") or not unit else " "
         self.readout.setText(f"{value:.{digits}f}{sep}{unit}")

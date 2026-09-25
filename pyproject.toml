@@ -11,7 +11,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "numpy>=1.26",
-    "PySide6>=6.6",
+    "PySide6-Essentials>=6.6",
     "scipy>=1.11",
     "sounddevice>=0.4.6",
 ]
@@ -20,6 +20,11 @@ dependencies = [
 dev = [
     "pytest>=8",
     "ruff>=0.5",
+]
+# PyInstaller is only a build tool: its bootloader license (GPL with an
+# exception) allows distributing the built app under our own license.
+build = [
+    "pyinstaller>=6.10",
 ]
 
 [project.scripts]
