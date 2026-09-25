@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import sys
 import time
 from collections.abc import Sequence
@@ -11,6 +10,7 @@ from collections.abc import Sequence
 import sounddevice as sd
 
 from timbrel import __version__
+from timbrel.app import _is_exclusive, start_engine
 from timbrel.core.chain import EffectChain
 from timbrel.core.effects import EFFECTS, Effect, NoiseGate
 from timbrel.core.engine import (
@@ -18,7 +18,6 @@ from timbrel.core.engine import (
     DEFAULT_SAMPLE_RATE,
     MAX_BLOCK_SIZE,
     MIN_BLOCK_SIZE,
-    Engine,
     EngineConfig,
 )
 from timbrel.platform import windows
@@ -69,7 +68,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-effects", action="store_true", help="list effects and their parameters and exit"
     )
+    gui = parser.add_argument_group("window")
+    gui.add_argument(
+        "--no-gui", action="store_true", help="run in the terminal (implied by the audio options)"
+    )
+    gui.add_argument("--minimized", action="store_true", help="start minimized to the tray")
+    gui.add_argument("--preset", metavar="NAME", help="preset to start with")
     return parser
+
+
+def wants_cli(args: argparse.Namespace) -> bool:
+    """Audio options (or --no-gui) run the terminal engine; otherwise the window."""
+    return bool(
+        args.no_gui
+        or args.input
+        or args.output
+        or args.effect
+        or args.gate
+        or args.exclusive_mic
+        or args.block_size != DEFAULT_BLOCK_SIZE
+    )
 
 
 def parse_params(text: str) -> dict[str, float]:
@@ -137,31 +155,6 @@ def format_device_list(wasapi: windows.WasapiDevices) -> str:
     if cable is None:
         lines.append(f"VB-Audio Virtual Cable not found. Install it from {windows.VB_CABLE_URL}")
     return "\n".join(lines).rstrip()
-
-
-def _is_exclusive(settings: sd.WasapiSettings | None) -> bool:
-    return settings is not None and bool(settings._streaminfo.flags & sd._lib.paWinWasapiExclusive)
-
-
-def start_engine(config: EngineConfig, chain: EffectChain) -> tuple[Engine, EngineConfig]:
-    """Start the engine, falling back to shared mode on each side that refuses
-    exclusive access (device busy or format unsupported)."""
-    shared = windows.shared_settings()
-    attempts = [
-        config,
-        dataclasses.replace(config, input_settings=shared),
-        dataclasses.replace(config, input_settings=shared, output_settings=shared),
-    ]
-    for attempt in attempts[:-1]:
-        engine = Engine(attempt, chain)
-        try:
-            engine.start()
-            return engine, attempt
-        except sd.PortAudioError:
-            pass
-    engine = Engine(attempts[-1], chain)
-    engine.start()
-    return engine, attempts[-1]
 
 
 def run(args: argparse.Namespace) -> int:
@@ -233,6 +226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.list_effects:
             print(format_effect_list())
             return 0
+        if not wants_cli(args):
+            from timbrel.ui import run_gui
+
+            return run_gui(minimized=args.minimized, preset=args.preset)
         return run(args)
     except (windows.DeviceError, ValueError, sd.PortAudioError) as exc:
         print(f"error: {exc}", file=sys.stderr)
