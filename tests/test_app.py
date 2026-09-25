@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import sounddevice as sd
 
@@ -20,7 +21,19 @@ class FakeEngine:
         self.chain = chain
         self.stats = StreamStats()
         self.monitor_enabled = False
+        self.output_muted = False
         self._running = False
+        self._capture = None
+        self.capture_progress = None
+
+    def start_capture(self, seconds):
+        # A loud 200 Hz "voice" arrives instantly in tests.
+        t = np.arange(int(seconds * 48000)) / 48000
+        self._capture = (0.3 * np.sin(2 * np.pi * 200 * t)).astype(np.float32)
+        self.capture_progress = 1.0
+
+    def captured(self):
+        return self._capture.copy()
 
     def start(self):
         exclusive = self.config.input_settings is not None and bool(
@@ -55,7 +68,20 @@ def reset_fake():
     FakeEngine.fail_always = False
 
 
-def make_controller(tmp_path, devices=DEVICES, settings=None, autostart=None):
+class FakePlayer:
+    def __init__(self):
+        self.played = []
+        self.playing = False
+
+    def play(self, clip, sample_rate, device):
+        self.played.append((clip, device))
+        self.playing = True
+
+    def stop(self):
+        self.playing = False
+
+
+def make_controller(tmp_path, devices=DEVICES, settings=None, autostart=None, player=None):
     wasapi = windows.wasapi_devices(devices, HOSTAPIS)
     return Controller(
         settings or Settings(),
@@ -64,6 +90,7 @@ def make_controller(tmp_path, devices=DEVICES, settings=None, autostart=None):
         query_devices=lambda: wasapi,
         engine_factory=FakeEngine,
         autostart=autostart or (lambda enabled: None),
+        player=player or FakePlayer(),
     )
 
 
@@ -293,3 +320,80 @@ def test_hotkeys_persist(tmp_path):
     c.set_hotkeys({"bypass": "ctrl+f9", "prev_preset": "", "next_preset": "f11"})
     saved = Settings.load(tmp_path / "settings.json")
     assert saved.hotkeys == {"bypass": "ctrl+f9", "prev_preset": "", "next_preset": "f11"}
+
+
+# --- voice test ------------------------------------------------------------------
+
+
+def test_voice_test_needs_running_audio(tmp_path):
+    c = make_controller(tmp_path)
+    assert not c.start_voice_test()
+    assert c.voice_test_state() == ("idle", 0.0)
+
+
+def test_voice_test_records_then_plays_with_effects(tmp_path):
+    player = FakePlayer()
+    c = make_controller(tmp_path, player=player)
+    c.start()
+    c.select_preset("Chipmunk")
+    assert c.start_voice_test(seconds=1.0)
+    assert c.voice_test_state()[0] == "ready"
+
+    c.play_voice_test(processed=True)
+    clip, device = player.played[-1]
+    assert c.voice_test_state()[0] == "playing"
+    assert c.engine.output_muted  # apps don't hear the speakers through the mic
+    assert device == 4  # default speakers, never the cable
+    assert len(clip) == 48000
+    assert np.all(np.isfinite(clip))
+
+    player.playing = False  # playback finished
+    c.poll()
+    assert not c.engine.output_muted
+    assert c.voice_test_state()[0] == "ready"
+
+
+def test_voice_test_original_is_unprocessed(tmp_path):
+    c = make_controller(tmp_path)
+    c.start()
+    c.start_voice_test(seconds=0.5)
+    c.voice_test_state()
+    raw = c.render_voice_test(processed=False)
+    np.testing.assert_array_equal(raw, c.engine.captured())
+
+
+def test_voice_test_uses_current_preset_and_edits(tmp_path):
+    c = make_controller(tmp_path)
+    c.start()
+    c.start_voice_test(seconds=1.0)
+    c.voice_test_state()
+    c.select_preset("Deep")
+    deep = c.render_voice_test()
+    c.set_param(0, "semitones", 12)
+    up = c.render_voice_test()
+    spectrum = lambda x: np.argmax(np.abs(np.fft.rfft(x[24000:])))  # noqa: E731
+    assert spectrum(up) / spectrum(deep) == pytest.approx(2 ** (16 / 12), rel=0.05)
+
+
+def test_voice_test_playback_prefers_monitor_device(tmp_path):
+    player = FakePlayer()
+    c = make_controller(
+        tmp_path, settings=Settings(monitor_device="Headphones (USB Mic)"), player=player
+    )
+    c.start()
+    c.start_voice_test(seconds=0.2)
+    c.voice_test_state()
+    c.play_voice_test()
+    assert player.played[-1][1] == 7
+
+
+def test_stop_playback_unmutes(tmp_path):
+    player = FakePlayer()
+    c = make_controller(tmp_path, player=player)
+    c.start()
+    c.start_voice_test(seconds=0.2)
+    c.voice_test_state()
+    c.play_voice_test()
+    c.stop_test_playback()
+    assert not player.playing
+    assert not c.engine.output_muted

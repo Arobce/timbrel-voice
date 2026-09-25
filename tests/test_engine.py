@@ -171,3 +171,35 @@ def test_ring_prebuffers_before_playing():
     ring.write(np.ones(100, np.float32))
     assert ring.read(out)
     assert np.all(out == 1.0)
+
+
+# --- voice test capture and output mute -------------------------------------------
+
+
+def test_capture_records_raw_mic_across_blocks():
+    engine = make_engine()
+    engine.start_capture(0.01)  # 480 samples
+    assert engine.capture_progress == 0.0
+    blocks = [np.full((256, 1), k + 1, np.float32) for k in range(3)]
+    for block in blocks:
+        run_block(engine, block, 2)
+    assert engine.capture_progress == 1.0
+    clip = engine.captured()
+    assert len(clip) == 480
+    assert np.all(clip[:256] == 1.0)
+    assert np.all(clip[256:] == 2.0)
+
+
+def test_no_capture_until_started():
+    engine = make_engine()
+    run_block(engine, np.ones((256, 1), np.float32), 2)
+    assert engine.capture_progress is None
+    assert len(engine.captured()) == 0
+
+
+def test_muted_output_is_silent_but_meters_still_work():
+    engine = make_engine()
+    engine.output_muted = True
+    out = run_block(engine, np.full((256, 1), 0.5, np.float32), 2)
+    assert np.all(out == 0.0)
+    assert engine.stats.input_peak == pytest.approx(0.5)

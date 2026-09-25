@@ -13,7 +13,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, Protocol
 
+import numpy as np
 import sounddevice as sd
 
 from timbrel.core.chain import EffectChain
@@ -51,6 +53,35 @@ def start_engine(
     return engine, attempts[-1]
 
 
+VOICE_TEST_SECONDS = 5.0
+
+VoiceTestState = Literal["idle", "recording", "ready", "playing"]
+
+
+class Player(Protocol):
+    """Plays a mono clip on an output device (voice test)."""
+
+    def play(self, clip: np.ndarray, sample_rate: int, device: int | None) -> None: ...
+    def stop(self) -> None: ...
+    @property
+    def playing(self) -> bool: ...
+
+
+class SoundDevicePlayer:
+    def play(self, clip: np.ndarray, sample_rate: int, device: int | None) -> None:
+        sd.play(clip, sample_rate, device=device, extra_settings=windows.shared_settings())
+
+    def stop(self) -> None:
+        sd.stop()
+
+    @property
+    def playing(self) -> bool:
+        try:
+            return bool(sd.get_stream().active)
+        except RuntimeError:  # nothing has been played yet
+            return False
+
+
 RETRY_SECONDS = 2.0  # how often a paused engine retries its devices
 STALL_POLLS = 3  # polls (~0.5 s apart) with no audio callbacks = device gone
 
@@ -80,6 +111,7 @@ class Controller:
         autostart: Callable[[bool], None] | None = None,
         rescan_devices: Callable[[], windows.WasapiDevices] | None = None,
         clock: Callable[[], float] | None = None,
+        player: Player | None = None,
     ) -> None:
         self.settings = settings
         self._settings_path = settings_path
@@ -91,6 +123,9 @@ class Controller:
         self._stalls = 0
         self._next_retry = 0.0
         self.devices_version = 0
+        self._player = player or SoundDevicePlayer()
+        self._test_clip: np.ndarray | None = None
+        self._test_playing = False
         self._engine_factory = engine_factory
         self._autostart = autostart or (lambda enabled: windows.set_autostart(enabled))
         self.engine: Engine | None = None
@@ -194,6 +229,10 @@ class Controller:
         except (windows.DeviceError, sd.PortAudioError, ValueError) as exc:
             self.engine = None
             self.error = str(exc)
+            if isinstance(exc, sd.PortAudioError):
+                self.error += (
+                    ". Another app, or another copy of Timbrel, may be using the device exclusively"
+                )
             self._next_retry = self._clock() + RETRY_SECONDS
             self._notify()
             return False
@@ -216,6 +255,8 @@ class Controller:
     def poll(self) -> None:
         """Call about twice a second from the UI thread. Detects a device that
         stopped delivering audio (unplugged) and retries a paused engine."""
+        if self._test_playing and not self._player.playing:
+            self._end_test_playback()
         engine = self.engine
         if engine is not None:
             blocks = engine.stats.blocks
@@ -374,6 +415,83 @@ class Controller:
         self._autostart(enabled)
         self.settings.start_with_windows = enabled
         self._save()
+
+    # --- voice test: record a few seconds, play back with effects -------------
+
+    def start_voice_test(self, seconds: float = VOICE_TEST_SECONDS) -> bool:
+        """Start recording the raw mic. False if audio isn't running."""
+        if self.engine is None or not self.engine.running:
+            return False
+        self.stop_test_playback()
+        self._test_clip = None
+        self.engine.start_capture(seconds)
+        self._notify()
+        return True
+
+    def voice_test_state(self) -> tuple[VoiceTestState, float]:
+        """Current state and recording progress (0..1)."""
+        if self._test_playing:
+            return "playing", 1.0
+        if self._test_clip is not None:
+            return "ready", 1.0
+        progress = self.engine.capture_progress if self.engine is not None else None
+        if progress is None:
+            return "idle", 0.0
+        if progress >= 1.0:
+            self._test_clip = self.engine.captured()
+            self._notify()
+            return "ready", 1.0
+        return "recording", progress
+
+    def render_voice_test(self, processed: bool = True) -> np.ndarray:
+        """The recording, optionally run through the current preset and
+        sliders (with fresh effect instances; the live chain is untouched)."""
+        if self._test_clip is None:
+            raise RuntimeError("no voice test recorded")
+        clip = self._test_clip.copy()
+        if not processed:
+            return clip
+        bs = self.settings.block_size
+        preset = self.snapshot("test")
+        chain = EffectChain(DEFAULT_SAMPLE_RATE, bs, preset.build_effects(DEFAULT_SAMPLE_RATE, bs))
+        chain.gate.set_params(**preset.gate_params())
+        out = np.empty_like(clip)
+        for start in range(0, len(clip), bs):
+            out[start : start + bs] = chain.process(clip[start : start + bs].copy())
+        return out
+
+    def play_voice_test(self, processed: bool = True) -> None:
+        clip = self.render_voice_test(processed)
+        self.stop_test_playback()
+        device = self._playback_device()
+        # The mic may hear the speakers: keep the playback out of calls.
+        if self.engine is not None:
+            self.engine.output_muted = True
+        self._player.play(clip, DEFAULT_SAMPLE_RATE, device.index if device else None)
+        self._test_playing = True
+        self._notify()
+
+    def stop_test_playback(self) -> None:
+        if self._test_playing:
+            self._player.stop()
+            self._end_test_playback()
+
+    def _end_test_playback(self) -> None:
+        self._test_playing = False
+        if self.engine is not None:
+            self.engine.output_muted = False
+        self._notify()
+
+    def _playback_device(self) -> windows.Device | None:
+        """Monitor device if set, else the default speakers (never the cable)."""
+        device = windows.find_by_name(self.settings.monitor_device, "output", self.devices)
+        if device is None:
+            default = self.devices.default("output")
+            device = self.devices.by_index(default) if default is not None else None
+        if device is None or windows.is_virtual_cable(device):
+            candidates = self.monitor_devices()
+            device = candidates[0] if candidates else None
+        return device
 
     def set_hotkeys(self, hotkeys: dict[str, str]) -> None:
         self.settings.hotkeys = dict(hotkeys)

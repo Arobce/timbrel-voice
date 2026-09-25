@@ -23,6 +23,7 @@ DEFAULT_SAMPLE_RATE = 48_000
 DEFAULT_BLOCK_SIZE = 256
 MIN_BLOCK_SIZE = 128
 MAX_BLOCK_SIZE = 1024
+MAX_CAPTURE_SECONDS = 10  # voice-test recordings
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,15 @@ class Engine:
         self.chain = chain
         self.stats = StreamStats()
         self.monitor_enabled = False
+        # While True, apps hear silence (e.g. a voice-test clip is playing and
+        # the mic could pick it up from speakers).
+        self.output_muted = False
+        # Voice-test capture of the raw mic, preallocated. The UI thread sets
+        # _capture_pos = 0 then _capture_len; the audio thread fills and
+        # advances _capture_pos until it reaches _capture_len.
+        self._capture = np.zeros(MAX_CAPTURE_SECONDS * config.sample_rate, dtype=np.float32)
+        self._capture_pos = 0
+        self._capture_len = 0
         self._mono = np.zeros(MAX_BLOCK_SIZE, dtype=np.float32)
         self._monitor_buf = np.zeros(MAX_BLOCK_SIZE * 4, dtype=np.float32)
         # WASAPI wakes each stream in bursts (e.g. two 256-sample callbacks
@@ -174,6 +184,11 @@ class Engine:
         mono = self._mono[:frames]
         np.copyto(mono, indata[:frames, 0])
         stats.input_peak = float(max(mono.max(), -mono.min())) if frames else 0.0
+        pos, length = self._capture_pos, self._capture_len
+        if pos < length:
+            k = min(frames, length - pos)
+            self._capture[pos : pos + k] = mono[:k]
+            self._capture_pos = pos + k
         if self.chain is not None:
             mono = self.chain.process(mono)
         stats.output_peak = float(max(mono.max(), -mono.min())) if frames else 0.0
@@ -190,7 +205,10 @@ class Engine:
         status: sd.CallbackFlags,
     ) -> None:
         mono = self._process(indata, frames, status)
-        outdata[:frames] = mono[:, np.newaxis]
+        if self.output_muted:
+            outdata.fill(0.0)
+        else:
+            outdata[:frames] = mono[:, np.newaxis]
 
     def _input_callback(
         self, indata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags
@@ -264,6 +282,24 @@ class Engine:
                 s.stop()
                 s.close()
         self._ring.clear()
+
+    def start_capture(self, seconds: float) -> None:
+        """Start recording the raw mic (voice test); see ``capture_progress``."""
+        length = min(int(seconds * self.config.sample_rate), len(self._capture))
+        self._capture_len = 0
+        self._capture_pos = 0
+        self._capture_len = length
+
+    @property
+    def capture_progress(self) -> float | None:
+        """0..1 while recording or finished; None if no capture was started."""
+        if self._capture_len == 0:
+            return None
+        return min(1.0, self._capture_pos / self._capture_len)
+
+    def captured(self) -> np.ndarray:
+        """A copy of what has been recorded so far."""
+        return self._capture[: self._capture_pos].copy()
 
     def set_monitor(self, enabled: bool) -> None:
         if enabled and not self.monitor_enabled:

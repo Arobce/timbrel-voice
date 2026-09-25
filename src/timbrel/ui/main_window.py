@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSystemTrayIcon,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from timbrel.app import Controller
+from timbrel.app import VOICE_TEST_SECONDS, Controller
 from timbrel.core.effects import Effect
 from timbrel.platform.windows import VB_CABLE_URL
 from timbrel.presets import PresetError
@@ -87,6 +88,7 @@ class MainWindow(QMainWindow):
         middle.addWidget(self._build_effects(), 2)
         root.addLayout(middle, 1)
 
+        root.addWidget(self._build_voice_test())
         root.addLayout(self._build_bottom())
         root.addWidget(self._build_settings())
 
@@ -156,6 +158,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.effects_area, 1)
         self._built_for: tuple[int, ...] = ()
         return box
+
+    def _build_voice_test(self) -> QGroupBox:
+        box = QGroupBox("Voice test: hear what you sound like")
+        row = QHBoxLayout(box)
+        self.record_button = QPushButton(f"\u25cf  Record {VOICE_TEST_SECONDS:.0f} s")
+        self.record_button.clicked.connect(self._record_test)
+        self.record_progress = QProgressBar()
+        self.record_progress.setRange(0, 100)
+        self.record_progress.setTextVisible(False)
+        self.record_progress.setMaximumWidth(120)
+        self.play_fx_button = QPushButton("\u25b6  Play with effects")
+        self.play_fx_button.clicked.connect(lambda: self._play_test(processed=True))
+        self.play_raw_button = QPushButton("\u25b6  Play original")
+        self.play_raw_button.clicked.connect(lambda: self._play_test(processed=False))
+        self.stop_test_button = QPushButton("\u25a0  Stop")
+        self.stop_test_button.clicked.connect(self.controller.stop_test_playback)
+        self.test_hint = QLabel()
+        self.test_hint.setWordWrap(True)
+        for widget in (
+            self.record_button,
+            self.record_progress,
+            self.play_fx_button,
+            self.play_raw_button,
+            self.stop_test_button,
+        ):
+            row.addWidget(widget)
+        row.addWidget(self.test_hint, 1)
+        self._update_voice_test()
+        return box
+
+    def _record_test(self) -> None:
+        if not self.controller.start_voice_test():
+            QMessageBox.information(
+                self, "Audio isn't running", "Start audio (check the devices) and try again."
+            )
+        self._update_voice_test()
+
+    def _play_test(self, processed: bool) -> None:
+        self.controller.play_voice_test(processed=processed)
+        self._update_voice_test()
+
+    def _update_voice_test(self) -> None:
+        state, progress = self.controller.voice_test_state()
+        running = self.controller.engine is not None
+        self.record_button.setEnabled(running and state != "recording")
+        self.record_progress.setValue(int(progress * 100))
+        self.play_fx_button.setEnabled(state in ("ready", "playing"))
+        self.play_raw_button.setEnabled(state in ("ready", "playing"))
+        self.stop_test_button.setEnabled(state == "playing")
+        hints = {
+            "idle": "Record a few seconds, then play it back with any preset. Nothing is saved.",
+            "recording": "Recording\u2026 talk normally.",
+            "ready": f"Pick a preset and press play to hear it with {self.controller.preset.name}"
+            ". Plays on your monitor device (or speakers).",
+            "playing": "Playing\u2026 apps hear silence from Timbrel until it finishes.",
+        }
+        self.test_hint.setText(hints[state])
 
     def _build_bottom(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -332,6 +391,7 @@ class MainWindow(QMainWindow):
         return box
 
     def tick(self) -> None:
+        self._update_voice_test()
         status = self.controller.status()
         self.input_meter.set_peak(status.input_peak)
         self.output_meter.set_peak(status.output_peak)
@@ -440,6 +500,7 @@ class MainWindow(QMainWindow):
 
     def quit(self) -> None:
         self._quitting = True
+        self.controller.stop_test_playback()
         if self.hotkeys is not None:
             self.hotkeys.close()
         self.poll_timer.stop()
