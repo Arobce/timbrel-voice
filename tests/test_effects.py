@@ -384,3 +384,12 @@ def test_echo_mix_zero_is_dry():
     echo.set_params(mix=0.0)
     tone = sine(300)
     np.testing.assert_allclose(run(echo, tone), tone, atol=1e-6)
+
+
+@pytest.mark.parametrize("gain_db", [-6.0, 3.0, 6.0])
+def test_eq_warmth_shelf(gain_db):
+    low = run(_eq(low_cut_hz=20, warmth_db=gain_db), sine(60, amp=0.1))[SR // 5 :]
+    high = run(_eq(low_cut_hz=20, warmth_db=gain_db), sine(4000, amp=0.1))[SR // 5 :]
+    level = 0.1 / np.sqrt(2)
+    assert 20 * np.log10(band_rms(low) / level) == pytest.approx(gain_db, abs=0.5)
+    assert 20 * np.log10(band_rms(high) / level) == pytest.approx(0.0, abs=0.3)

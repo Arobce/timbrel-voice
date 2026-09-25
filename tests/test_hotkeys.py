@@ -81,7 +81,7 @@ def test_preset_hotkeys_step_through_presets(qapp, tmp_path):
     bridge = hk.HotkeyBridge(controller, fake)
     fake.press("f11", from_thread=False)
     qapp.processEvents()
-    assert controller.preset.name == "Deep"
+    assert controller.preset.name == "Announcer"
     bridge._last.clear()
     fake.press("f10", from_thread=False)
     qapp.processEvents()

@@ -1,4 +1,4 @@
-"""Voice EQ: low cut (rumble) and presence boost (clarity)."""
+"""Voice EQ: low cut (rumble), warmth (low shelf) and presence (clarity)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from timbrel.core.params import ParamSpec
 
 PRESENCE_HZ = 3500.0
 PRESENCE_Q = 0.8
+WARMTH_HZ = 180.0
 
 
 def peaking_sos(freq: float, gain_db: float, q: float, sample_rate: int) -> np.ndarray:
@@ -26,17 +27,38 @@ def peaking_sos(freq: float, gain_db: float, q: float, sample_rate: int) -> np.n
     return np.array([[*(x / den[0] for x in b), 1.0, den[1] / den[0], den[2] / den[0]]])
 
 
+def low_shelf_sos(freq: float, gain_db: float, sample_rate: int) -> np.ndarray:
+    """RBJ cookbook low shelf (slope 1) as one second-order section."""
+    a = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * math.pi * freq / sample_rate
+    cos_w0 = math.cos(w0)
+    alpha = math.sin(w0) / 2.0 * math.sqrt(2.0)  # shelf slope S = 1
+    root = 2.0 * math.sqrt(a) * alpha
+    b = [
+        a * ((a + 1) - (a - 1) * cos_w0 + root),
+        2 * a * ((a - 1) - (a + 1) * cos_w0),
+        a * ((a + 1) - (a - 1) * cos_w0 - root),
+    ]
+    den = [
+        (a + 1) + (a - 1) * cos_w0 + root,
+        -2 * ((a - 1) + (a + 1) * cos_w0),
+        (a + 1) + (a - 1) * cos_w0 - root,
+    ]
+    return np.array([[*(x / den[0] for x in b), 1.0, den[1] / den[0], den[2] / den[0]]])
+
+
 class Eq(Effect):
     name = "eq"
     PARAMS: Mapping[str, ParamSpec] = {
         "low_cut_hz": ParamSpec(80.0, 20.0, 300.0, "Hz"),
+        "warmth_db": ParamSpec(0.0, -6.0, 6.0, "dB"),
         "presence_db": ParamSpec(0.0, -6.0, 6.0, "dB"),
     }
 
     def __init__(self, sample_rate: int, block_size: int) -> None:
         super().__init__(sample_rate, block_size)
-        self._sos = np.zeros((2, 6))
-        self._zi = np.zeros((2, 2))
+        self._sos = np.zeros((3, 6))
+        self._zi = np.zeros((3, 2))
 
     def reset(self) -> None:
         self._zi.fill(0.0)
@@ -47,7 +69,8 @@ class Eq(Effect):
         self._sos[0] = signal.butter(
             2, params["low_cut_hz"], btype="highpass", fs=self.sample_rate, output="sos"
         )[0]
-        self._sos[1] = peaking_sos(
+        self._sos[1] = low_shelf_sos(WARMTH_HZ, params["warmth_db"], self.sample_rate)[0]
+        self._sos[2] = peaking_sos(
             PRESENCE_HZ, params["presence_db"], PRESENCE_Q, self.sample_rate
         )[0]
 

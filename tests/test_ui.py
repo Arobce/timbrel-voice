@@ -40,7 +40,7 @@ def sliders(window):
 def test_window_shows_devices_presets_and_state(window):
     assert window.input_combo.currentText() == "Microphone (USB Mic)"
     assert window.output_combo.currentText() == "CABLE Input (VB-Audio Virtual Cable)"
-    assert window.preset_list.count() == 7
+    assert window.preset_list.count() == 8
     assert window.preset_list.currentItem().text() == "Clean"
     assert "EFFECTS ON" in window.bypass_button.text()
     assert not window.cable_banner.isVisibleTo(window)
@@ -65,7 +65,7 @@ def test_tray_bypass_and_preset_menu(window):
 
 
 def test_selecting_preset_rebuilds_sliders(window):
-    window.preset_list.setCurrentRow(3)  # Robot
+    window.preset_list.setCurrentRow(4)  # Robot
     assert window.controller.preset.name == "Robot"
     names = [s.name for s in sliders(window)]
     assert names[:2] == ["threshold_db", "release_ms"]  # gate first

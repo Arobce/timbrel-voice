@@ -1,0 +1,10 @@
+{
+  "name": "Announcer",
+  "description": "Formal, polished broadcast voice: a touch deeper, warm and clear, with even loudness. Keeps your own accent.",
+  "gate": {"threshold_db": -50, "release_ms": 250},
+  "effects": [
+    {"type": "pitch", "params": {"semitones": -2}},
+    {"type": "eq", "params": {"low_cut_hz": 70, "warmth_db": 3, "presence_db": 3}},
+    {"type": "compressor", "params": {"threshold_db": -30, "ratio": 4}}
+  ]
+}

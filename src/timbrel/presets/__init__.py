@@ -19,7 +19,7 @@ from typing import Any
 from timbrel.core.effects import EFFECTS, Effect, NoiseGate
 
 BUILTIN_DIR = Path(__file__).with_name("builtin")
-BUILTIN_ORDER = ["Clean", "Deep", "Chipmunk", "Robot", "Radio", "Demon", "Cave"]
+BUILTIN_ORDER = ["Clean", "Announcer", "Deep", "Chipmunk", "Robot", "Radio", "Demon", "Cave"]
 MAX_NAME_LENGTH = 40
 
 
