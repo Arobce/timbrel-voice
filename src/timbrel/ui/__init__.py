@@ -29,6 +29,9 @@ def run_gui(minimized: bool = False, preset: str | None = None) -> int:
     controller.start()
 
     window = MainWindow(controller)
+    from timbrel.ui.hotkeys import HotkeyBridge
+
+    window.hotkeys = HotkeyBridge(controller)
     if QSystemTrayIcon.isSystemTrayAvailable():
         window.tray = Tray(window)
         window.tray.show()

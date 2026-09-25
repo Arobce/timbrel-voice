@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from timbrel.core.engine import DEFAULT_BLOCK_SIZE, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE
+from timbrel.platform.windows import DEFAULT_HOTKEYS
 from timbrel.presets import write_json_atomic
 
 
@@ -15,7 +16,7 @@ from timbrel.presets import write_json_atomic
 class Settings:
     # Devices are remembered by name: PortAudio indices change between boots.
     input_device: str | None = None
-    output_device: str | None = None
+    output_device: str | None = None  # None = VB-Cable if present; "" = none
     monitor_device: str | None = None
     monitor_enabled: bool = False
     # Exclusive mic mode: ~18 ms lower latency; falls back to shared when busy.
@@ -25,6 +26,8 @@ class Settings:
     bypass: bool = False
     start_with_windows: bool = False
     first_run_done: bool = False
+    # action -> hotkey, e.g. {"bypass": "f9"}; empty string = unbound
+    hotkeys: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_HOTKEYS))
 
     @classmethod
     def load(cls, path: Path) -> Settings:
@@ -40,6 +43,11 @@ class Settings:
         for f in fields(cls):
             if f.name in data and _valid(f.name, data[f.name]):
                 setattr(settings, f.name, data[f.name])
+        hotkeys = data.get("hotkeys")
+        if isinstance(hotkeys, dict):
+            for action in DEFAULT_HOTKEYS:
+                if isinstance(hotkeys.get(action), str):
+                    settings.hotkeys[action] = hotkeys[action]
         return settings
 
     def save(self, path: Path) -> None:
@@ -57,4 +65,6 @@ def _valid(name: str, value: Any) -> bool:
             and not isinstance(value, bool)
             and MIN_BLOCK_SIZE <= value <= MAX_BLOCK_SIZE
         )
+    if name == "hotkeys":
+        return False  # merged separately, per action
     return isinstance(value, bool)

@@ -7,10 +7,12 @@ without audio hardware.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
+import threading
 import winreg
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -239,3 +241,183 @@ def autostart_enabled() -> bool:
             return True
     except FileNotFoundError:
         return False
+
+
+def rescan_devices() -> WasapiDevices:
+    """Re-read the device list. PortAudio caches it at startup, so plugging a
+    device back in is only seen after re-initialising. No streams may be open."""
+    sd._terminate()
+    sd._initialize()
+    return query_wasapi_devices()
+
+
+# --- global hotkeys -----------------------------------------------------------
+
+DEFAULT_HOTKEYS = {"bypass": "f9", "prev_preset": "f10", "next_preset": "f11"}
+
+
+_MODIFIER_VKS = {
+    0x10: "shift", 0xA0: "shift", 0xA1: "shift",
+    0x11: "ctrl", 0xA2: "ctrl", 0xA3: "ctrl",
+    0x12: "alt", 0xA4: "alt", 0xA5: "alt",
+    0x5B: "windows", 0x5C: "windows",
+}  # fmt: skip
+MODIFIERS = ("ctrl", "alt", "shift", "windows")
+KEY_CODES: dict[str, int] = {
+    **{f"f{i}": 0x6F + i for i in range(1, 25)},
+    **{chr(c): c for c in range(ord("A"), ord("Z") + 1)},
+    **{str(d): 0x30 + d for d in range(10)},
+    **{f"num {d}": 0x60 + d for d in range(10)},
+    "space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B, "backspace": 0x08,
+    "pause": 0x13, "scroll lock": 0x91, "insert": 0x2D, "delete": 0x2E,
+    "home": 0x24, "end": 0x23, "page up": 0x21, "page down": 0x22,
+    "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+}  # fmt: skip
+KEY_CODES = {name.lower(): vk for name, vk in KEY_CODES.items()}
+
+
+def parse_hotkey(text: str) -> tuple[frozenset[str], int]:
+    """ "ctrl+shift+f9" -> ({"ctrl", "shift"}, VK_F9). Exactly one non-modifier key."""
+    parts = [p.strip().lower() for p in text.split("+")]
+    if not parts or any(not p for p in parts):
+        raise ValueError(f"{text!r} is not a valid hotkey")
+    mods = frozenset(p for p in parts if p in MODIFIERS)
+    keys = [p for p in parts if p not in MODIFIERS]
+    if len(keys) != 1 or keys[0] not in KEY_CODES or len(mods) != len(parts) - 1:
+        raise ValueError(f"{text!r} is not a valid hotkey")
+    return mods, KEY_CODES[keys[0]]
+
+
+def normalize_hotkey(text: str) -> str:
+    """Validate a hotkey like "Ctrl + Shift+F9"; returns "ctrl+shift+f9"."""
+    mods, vk = parse_hotkey(text)
+    key = next(name for name, code in KEY_CODES.items() if code == vk)
+    return "+".join([*(m for m in MODIFIERS if m in mods), key])
+
+
+class HotkeyMatcher:
+    """Turns raw key-down/up events into hotkey hits.
+
+    Tracks which modifiers are held, fires on the key-down of the main key
+    only when the held modifiers match exactly, and ignores auto-repeat.
+    """
+
+    def __init__(self) -> None:
+        self.bindings: dict[tuple[frozenset[str], int], Callable[[], None]] = {}
+        self._held: set[int] = set()
+
+    def set_bindings(self, bindings: Mapping[str, Callable[[], None]]) -> None:
+        self.bindings = {parse_hotkey(k): cb for k, cb in bindings.items()}
+
+    def feed(self, vk: int, down: bool) -> Callable[[], None] | None:
+        """Process one key event; returns the callback to run, if any."""
+        if not down:
+            self._held.discard(vk)
+            return None
+        repeat = vk in self._held
+        self._held.add(vk)
+        if repeat or vk in _MODIFIER_VKS:
+            return None
+        mods = frozenset(_MODIFIER_VKS[k] for k in self._held if k in _MODIFIER_VKS)
+        return self.bindings.get((mods, vk))
+
+
+class GlobalHotkeys:
+    """System-wide hotkeys through a low-level keyboard hook (WH_KEYBOARD_LL).
+
+    They fire while a full-screen game has focus, and keys are never
+    swallowed: the game still gets them. They can't see keys sent to a program
+    running as administrator unless Timbrel runs as administrator too.
+    Callbacks run on the hook's thread and must return quickly (Windows drops
+    hooks that stall): hand work to the UI thread before touching Qt.
+    """
+
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x100, 0x101, 0x104, 0x105
+    WM_QUIT = 0x0012
+
+    def __init__(self) -> None:
+        self.matcher = HotkeyMatcher()
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+        self._ready = threading.Event()
+        self._error: str | None = None
+
+    def bind(self, bindings: Mapping[str, Callable[[], None]]) -> list[str]:
+        """Replace all hotkeys; returns error messages (empty on success)."""
+        valid, errors = {}, []
+        for hotkey, callback in bindings.items():
+            try:
+                parse_hotkey(hotkey)
+                valid[hotkey] = callback
+            except ValueError as exc:
+                errors.append(str(exc))
+        self.matcher.set_bindings(valid)
+        if valid and self._thread is None:
+            self._start()
+        if self._error:
+            errors.append(self._error)
+        return errors
+
+    def clear(self) -> None:
+        self.matcher.set_bindings({})
+        if self._thread is not None:
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _start(self) -> None:
+        self._ready.clear()
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name="timbrel-hotkeys", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2)
+
+    def _run(self) -> None:
+        from ctypes import wintypes as wt
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        lresult = ctypes.c_ssize_t
+        hook_proc_type = ctypes.WINFUNCTYPE(lresult, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_proc_type, wt.HINSTANCE, wt.DWORD]
+        user32.SetWindowsHookExW.restype = wt.HHOOK
+        user32.CallNextHookEx.argtypes = [wt.HHOOK, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+        user32.CallNextHookEx.restype = lresult
+
+        class KbdLlHookStruct(ctypes.Structure):
+            _fields_ = [
+                ("vkCode", wt.DWORD),
+                ("scanCode", wt.DWORD),
+                ("flags", wt.DWORD),
+                ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        down_msgs = (self.WM_KEYDOWN, self.WM_SYSKEYDOWN)
+        up_msgs = (self.WM_KEYUP, self.WM_SYSKEYUP)
+
+        def proc(code: int, wparam: int, lparam: int) -> int:
+            if code >= 0 and wparam in down_msgs + up_msgs:
+                vk = ctypes.cast(lparam, ctypes.POINTER(KbdLlHookStruct)).contents.vkCode
+                callback = self.matcher.feed(vk, wparam in down_msgs)
+                if callback is not None:
+                    try:
+                        callback()
+                    except Exception:  # noqa: BLE001 - never let a hotkey kill the hook
+                        pass
+            return user32.CallNextHookEx(None, code, wparam, lparam)
+
+        callback_ref = hook_proc_type(proc)  # keep alive for the hook's lifetime
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        hook = user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, callback_ref, None, 0)
+        if not hook:
+            self._error = f"couldn't install keyboard hook (error {ctypes.get_last_error()})"
+            self._ready.set()
+            self._thread = None
+            return
+        self._ready.set()
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        user32.UnhookWindowsHookEx(hook)

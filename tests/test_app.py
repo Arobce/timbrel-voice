@@ -115,10 +115,11 @@ def test_remembers_devices_by_name(tmp_path):
     assert Settings.load(tmp_path / "settings.json").input_device == "Microphone (Webcam)"
 
 
-def test_missing_saved_device_falls_back_to_default(tmp_path):
+def test_missing_saved_mic_pauses_instead_of_switching(tmp_path):
     c = make_controller(tmp_path, settings=Settings(input_device="Unplugged Mic"))
-    c.start()
-    assert c.engine.config.input_device == 3
+    assert not c.start()
+    assert c.engine is None
+    assert "Unplugged Mic" in c.status().error
 
 
 def test_select_preset_swaps_effects_and_persists(tmp_path):
@@ -205,3 +206,90 @@ def test_start_with_windows_calls_autostart(tmp_path):
 def test_unknown_saved_preset_falls_back(tmp_path):
     c = make_controller(tmp_path, settings=Settings(preset="Deleted One"))
     assert c.preset.name == "Clean"
+
+
+# --- unplug detection and auto-resume ------------------------------------------
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def make_pluggable(tmp_path, settings=None):
+    """Controller whose rescans return whatever ``state['devices']`` holds."""
+    state = {"devices": DEVICES}
+    clock = Clock()
+    c = Controller(
+        settings or Settings(),
+        tmp_path / "settings.json",
+        PresetLibrary(tmp_path / "presets"),
+        query_devices=lambda: windows.wasapi_devices(state["devices"], HOSTAPIS),
+        rescan_devices=lambda: windows.wasapi_devices(state["devices"], HOSTAPIS),
+        engine_factory=FakeEngine,
+        autostart=lambda enabled: None,
+        clock=clock,
+    )
+    return c, state, clock
+
+
+def test_first_start_remembers_chosen_devices(tmp_path):
+    c = make_controller(tmp_path)
+    c.start()
+    saved = Settings.load(tmp_path / "settings.json")
+    assert saved.input_device == "Microphone (USB Mic)"
+    assert saved.output_device == "CABLE Input (VB-Audio Virtual Cable)"
+
+
+def test_stalled_stream_pauses_then_resumes_when_device_returns(tmp_path):
+    c, state, clock = make_pluggable(tmp_path)
+    assert c.start()
+    # Callbacks stop arriving (mic unplugged): paused after a few polls.
+    for _ in range(4):
+        c.poll()
+    assert c.engine is None
+    assert "stopped responding" in c.status().error
+
+    # Still gone: the retry keeps it paused and explains why.
+    state["devices"] = [d for d in DEVICES if d["name"] != "Microphone (USB Mic)"]
+    clock.now += 3
+    c.poll()
+    assert c.engine is None
+    assert "unplugged" in c.status().error
+
+    # Plugged back in: resumes on the next retry.
+    state["devices"] = DEVICES
+    clock.now += 1
+    c.poll()
+    assert c.engine is None  # waits for the retry interval
+    clock.now += 2
+    c.poll()
+    assert c.engine is not None
+    assert c.status().running
+    assert c.status().error is None
+
+
+def test_poll_keeps_a_healthy_engine_running(tmp_path):
+    c, _, _ = make_pluggable(tmp_path)
+    c.start()
+    for _ in range(10):
+        c.engine.stats.blocks += 90  # audio is flowing
+        c.poll()
+    assert c.engine is not None
+
+
+def test_explicit_no_output_is_monitor_only(tmp_path):
+    c = make_controller(tmp_path, settings=Settings(output_device=""))
+    assert c.start()
+    assert c.engine.config.output_device is None
+    assert c.engine.monitor_enabled
+
+
+def test_hotkeys_persist(tmp_path):
+    c = make_controller(tmp_path)
+    c.set_hotkeys({"bypass": "ctrl+f9", "prev_preset": "", "next_preset": "f11"})
+    saved = Settings.load(tmp_path / "settings.json")
+    assert saved.hotkeys == {"bypass": "ctrl+f9", "prev_preset": "", "next_preset": "f11"}

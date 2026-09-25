@@ -30,6 +30,7 @@ from timbrel.app import Controller
 from timbrel.core.effects import Effect
 from timbrel.platform.windows import VB_CABLE_URL
 from timbrel.presets import PresetError
+from timbrel.ui.hotkeys import ACTION_LABELS, HotkeyBridge, HotkeysDialog
 from timbrel.ui.widgets import BYPASS_COLOR, ON_COLOR, LevelMeter, ParamSlider, state_icon
 
 BLOCK_SIZES = [128, 256, 512, 1024]
@@ -49,6 +50,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.controller = controller
         self.tray: Tray | None = None
+        self.hotkeys: HotkeyBridge | None = None
+        self._devices_version = -1
+        self._was_paused = False
         self._quitting = False
         self._told_about_tray = False
         self.setWindowTitle("Timbrel")
@@ -93,6 +97,10 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
+        # Unplug detection and auto-resume.
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(controller.poll)
+        self.poll_timer.start(500)
 
     # --- construction --------------------------------------------------------
 
@@ -189,10 +197,13 @@ class MainWindow(QMainWindow):
         self.autostart_check = QCheckBox("Start with Windows (minimized, Clean preset)")
         self.autostart_check.setChecked(s.start_with_windows)
         self.autostart_check.toggled.connect(self._autostart_toggled)
+        self.hotkeys_button = QPushButton("Hotkeys…")
+        self.hotkeys_button.clicked.connect(self._edit_hotkeys)
         row.addWidget(self.exclusive_check)
         row.addWidget(QLabel("Block size"))
         row.addWidget(self.block_combo)
         row.addStretch(1)
+        row.addWidget(self.hotkeys_button)
         row.addWidget(self.autostart_check)
         return box
 
@@ -200,28 +211,30 @@ class MainWindow(QMainWindow):
 
     def refresh_devices(self) -> None:
         c, s = self.controller, self.controller.settings
+        self._devices_version = c.devices_version
 
-        def fill(combo: QComboBox, devices: list, selected: str | None, extra: str | None) -> None:
+        def fill(
+            combo: QComboBox,
+            devices: list,
+            selected: str | None,
+            extra: tuple[str, str | None] | None,
+        ) -> None:
             combo.blockSignals(True)
             combo.clear()
             if extra:
-                combo.addItem(extra, None)
+                combo.addItem(*extra)
             for device in devices:
                 combo.addItem(device.name, device.name)
-            index = combo.findData(selected) if selected else -1
+            index = combo.findData(selected) if selected is not None else -1
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.blockSignals(False)
 
         status = c.status()
         fill(self.input_combo, c.input_devices(), status.input_name or s.input_device, None)
         cable = c.cable
-        fill(
-            self.output_combo,
-            c.output_devices(),
-            s.output_device or (cable.name if cable else None),
-            "None (monitor only)",
-        )
-        fill(self.monitor_combo, c.monitor_devices(), s.monitor_device, "Default speakers")
+        output = s.output_device if s.output_device is not None else (cable.name if cable else "")
+        fill(self.output_combo, c.output_devices(), output, ("None (monitor only)", ""))
+        fill(self.monitor_combo, c.monitor_devices(), s.monitor_device, ("Default speakers", None))
         self.monitor_check.blockSignals(True)
         self.monitor_check.setChecked(s.monitor_enabled)
         self.monitor_check.blockSignals(False)
@@ -231,7 +244,15 @@ class MainWindow(QMainWindow):
         status = c.status()
         self.cable_banner.setVisible(not status.cable_found)
         self.error_banner.setVisible(bool(status.error))
-        self.error_banner.setText(f"Audio isn't running: {status.error}" if status.error else "")
+        self.error_banner.setText(
+            f"Audio paused: {status.error}. Timbrel keeps checking and resumes by itself "
+            "when the device is back."
+            if status.error
+            else ""
+        )
+        if c.devices_version != self._devices_version:
+            self.refresh_devices()
+        self._notify_pause_change(bool(status.error), status.error)
 
         names = c.library.names()
         self.preset_list.blockSignals(True)
@@ -263,9 +284,22 @@ class MainWindow(QMainWindow):
             "font-weight:700; border-radius:6px; }"
         )
         self.setWindowIcon(state_icon(on))
+        self._update_hotkey_hint()
         self.setWindowTitle(f"Timbrel — {'ON' if on else 'BYPASSED'} — {c.preset.name}")
         if self.tray is not None:
             self.tray.refresh()
+
+    def _notify_pause_change(self, paused: bool, reason: str | None) -> None:
+        # The window is often hidden (in a game), so say it in the tray too.
+        if paused == self._was_paused:
+            return
+        self._was_paused = paused
+        if self.tray is None:
+            return
+        if paused:
+            self.tray.showMessage("Timbrel: audio paused", f"{reason}. Resumes by itself.")
+        else:
+            self.tray.showMessage("Timbrel: audio resumed", "Your voice effects are back on.")
 
     def _refresh_title(self) -> None:
         c = self.controller
@@ -369,6 +403,26 @@ class MainWindow(QMainWindow):
             except PresetError as exc:
                 QMessageBox.warning(self, "Can't delete preset", str(exc))
 
+    def _edit_hotkeys(self) -> None:
+        dialog = HotkeysDialog(self.controller.settings.hotkeys, self)
+        if not dialog.exec():
+            return
+        self.controller.set_hotkeys(dialog.result_hotkeys)
+        if self.hotkeys is not None and self.hotkeys.bind():
+            QMessageBox.warning(
+                self, "Some hotkeys didn't register", "\n".join(self.hotkeys.errors)
+            )
+        self._update_hotkey_hint()
+
+    def _update_hotkey_hint(self) -> None:
+        keys = self.controller.settings.hotkeys
+        hint = ", ".join(
+            f"{ACTION_LABELS[a]}: {keys[a].upper()}" for a in ACTION_LABELS if keys.get(a)
+        )
+        self.hotkeys_button.setToolTip(hint or "No hotkeys set")
+        bypass_key = keys.get("bypass", "")
+        self.bypass_button.setToolTip(f"Hotkey: {bypass_key.upper()}" if bypass_key else "")
+
     def _autostart_toggled(self, enabled: bool) -> None:
         try:
             self.controller.set_start_with_windows(enabled)
@@ -386,6 +440,9 @@ class MainWindow(QMainWindow):
 
     def quit(self) -> None:
         self._quitting = True
+        if self.hotkeys is not None:
+            self.hotkeys.close()
+        self.poll_timer.stop()
         self.controller.stop()
         if self.tray is not None:
             self.tray.hide()
@@ -444,7 +501,10 @@ class Tray(QSystemTrayIcon):
         c = self.controller
         on = not c.bypassed
         self.setIcon(state_icon(on))
-        self.setToolTip(f"Timbrel — {'Effects ON' if on else 'BYPASSED'} ({c.preset.name})")
+        state = "Effects ON" if on else "BYPASSED"
+        if c.error:
+            state += ", audio paused"
+        self.setToolTip(f"Timbrel — {state} ({c.preset.name})")
         self.bypass_action.setChecked(not on)
         names = c.library.names()
         if names != self._preset_names:

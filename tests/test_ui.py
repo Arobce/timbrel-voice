@@ -24,9 +24,11 @@ def window(qapp, tmp_path):
     controller = make_controller(tmp_path)
     controller.start()
     win = MainWindow(controller)
+    win.poll_timer.stop()  # the fake engine never produces audio blocks
     win.tray = Tray(win)
     yield win
     win.timer.stop()
+    win.poll_timer.stop()
     win.tray.hide()
     win.deleteLater()
 

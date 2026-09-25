@@ -9,6 +9,7 @@ engine and chain, which publish changes by reference swap.
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,10 +51,14 @@ def start_engine(
     return engine, attempts[-1]
 
 
+RETRY_SECONDS = 2.0  # how often a paused engine retries its devices
+STALL_POLLS = 3  # polls (~0.5 s apart) with no audio callbacks = device gone
+
+
 @dataclass(frozen=True)
 class Status:
     running: bool
-    error: str | None
+    error: str | None  # why audio is paused; it retries automatically
     cable_found: bool
     input_name: str | None
     output_name: str | None
@@ -73,11 +78,19 @@ class Controller:
         query_devices: Callable[[], windows.WasapiDevices] = windows.query_wasapi_devices,
         engine_factory: Callable[..., Engine] = Engine,
         autostart: Callable[[bool], None] | None = None,
+        rescan_devices: Callable[[], windows.WasapiDevices] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.settings = settings
         self._settings_path = settings_path
         self.library = library
         self._query_devices = query_devices
+        self._rescan = rescan_devices or windows.rescan_devices
+        self._clock = clock or time.monotonic
+        self._last_blocks: int | None = None
+        self._stalls = 0
+        self._next_retry = 0.0
+        self.devices_version = 0
         self._engine_factory = engine_factory
         self._autostart = autostart or (lambda enabled: windows.set_autostart(enabled))
         self.engine: Engine | None = None
@@ -127,14 +140,28 @@ class Controller:
         return windows.find_cable(self.devices)
 
     def refresh_devices(self) -> None:
-        self.devices = self._query_devices()
+        """Re-scan devices (the engine must be stopped)."""
+        self.devices = self._rescan()
+        self.devices_version += 1
 
     def _resolve(self) -> tuple[windows.Device, windows.Device | None, windows.Device | None]:
         s = self.settings
-        mic = windows.find_by_name(s.input_device, "input", self.devices)
-        if mic is None or windows.is_virtual_cable(mic):
+        # A remembered device that's missing is an error (audio pauses and
+        # resumes when it's back), not a silent switch to another device.
+        if s.input_device:
+            mic = windows.find_by_name(s.input_device, "input", self.devices)
+            if mic is None:
+                raise windows.DeviceError(f"Microphone \u201c{s.input_device}\u201d is unplugged")
+        else:
             mic = windows.default_device("input", self.devices)
-        out = windows.find_by_name(s.output_device, "output", self.devices) or self.cable
+        if s.output_device == "":  # explicitly none: monitor only
+            out = None
+        elif s.output_device:
+            out = windows.find_by_name(s.output_device, "output", self.devices)
+            if out is None:
+                raise windows.DeviceError(f"Output \u201c{s.output_device}\u201d is missing")
+        else:
+            out = self.cable
         monitor = None
         if s.monitor_device:
             monitor = windows.find_by_name(s.monitor_device, "output", self.devices)
@@ -167,18 +194,54 @@ class Controller:
         except (windows.DeviceError, sd.PortAudioError, ValueError) as exc:
             self.engine = None
             self.error = str(exc)
+            self._next_retry = self._clock() + RETRY_SECONDS
             self._notify()
             return False
         self.engine.set_monitor(self.settings.monitor_enabled or out is None)
         self._mic, self._out = mic, out
         self._mic_exclusive = _is_exclusive(used.input_settings)
+        self._last_blocks, self._stalls = None, 0
+        # Remember what was opened (FR1), so an unplug pauses rather than switches.
+        changed = self.settings.input_device != mic.name
+        self.settings.input_device = mic.name
+        if out is not None:
+            changed |= self.settings.output_device != out.name
+            self.settings.output_device = out.name
+        if changed:
+            self._save()
         self.error = None
         self._notify()
         return True
 
+    def poll(self) -> None:
+        """Call about twice a second from the UI thread. Detects a device that
+        stopped delivering audio (unplugged) and retries a paused engine."""
+        engine = self.engine
+        if engine is not None:
+            blocks = engine.stats.blocks
+            self._stalls = self._stalls + 1 if blocks == self._last_blocks else 0
+            self._last_blocks = blocks
+            if not engine.running or self._stalls >= STALL_POLLS:
+                self.stop()
+                self.error = "Audio device stopped responding (unplugged?)"
+                self._next_retry = self._clock() + RETRY_SECONDS
+                self._notify()
+            return
+        if self.error is not None and self._clock() >= self._next_retry:
+            try:
+                self.refresh_devices()
+            except sd.PortAudioError as exc:
+                self.error = str(exc)
+                self._next_retry = self._clock() + RETRY_SECONDS
+                return
+            self.start()
+
     def stop(self) -> None:
         if self.engine is not None:
-            self.engine.stop()
+            try:
+                self.engine.stop()
+            except sd.PortAudioError:
+                pass  # the device may already be gone
             self.engine = None
 
     def set_devices(
@@ -311,6 +374,11 @@ class Controller:
         self._autostart(enabled)
         self.settings.start_with_windows = enabled
         self._save()
+
+    def set_hotkeys(self, hotkeys: dict[str, str]) -> None:
+        self.settings.hotkeys = dict(hotkeys)
+        self._save()
+        self._notify()
 
     def mark_first_run_done(self) -> None:
         self.settings.first_run_done = True
