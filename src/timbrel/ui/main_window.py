@@ -230,6 +230,11 @@ class MainWindow(QMainWindow):
         meters.addRow("In", self.input_meter)
         meters.addRow("Out", self.output_meter)
         self.status_label = QLabel()
+        self.status_label.setToolTip(
+            "Latency is Windows' own estimate for the audio streams plus effect delay; "
+            "real delay measured through VB-Cable is usually 10-15 ms lower. "
+            "Dropouts counts audio glitches on the mic-to-apps path (should stay 0)."
+        )
         meters.addRow("", self.status_label)
         row.addLayout(meters, 1)
         return row
@@ -397,7 +402,7 @@ class MainWindow(QMainWindow):
         self.output_meter.set_peak(status.output_peak)
         if status.running:
             mic = "exclusive mic" if status.mic_exclusive else "shared mic"
-            latency = f"~{status.latency_ms:.0f} ms reported" if status.latency_ms else "–"
+            latency = f"~{status.latency_ms:.0f} ms (estimate)" if status.latency_ms else "–"
             self.status_label.setText(f"Latency {latency} · Dropouts {status.xruns} · {mic}")
         else:
             self.status_label.setText("Audio stopped")
