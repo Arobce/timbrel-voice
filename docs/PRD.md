@@ -42,11 +42,19 @@ Timbrel is an open-source, real-time voice changer for Windows, for gaming and o
 | shared / exclusive (current: cable playback exclusive) | 67–78 ms |
 | exclusive / exclusive | 51–55 ms |
 
-PortAudio's reported latency is not reliable here (it reported 49 ms for the 93–117 ms case and 88 ms for the 51 ms case). With the pitch shifter's ~10 ms, the current total is ~80 ms, over the 40 ms target; see the M1 status notes.
+PortAudio's reported latency is not reliable here (it reported 49 ms for the 93–117 ms case and 88 ms for the 51 ms case).
+
+Further checks (VB-Cable internal rate 48 kHz):
+- WASAPI exclusive on both sides stays at 52–55 ms whatever buffer size is requested (`latency="low"`, 10, 5, 3, 0 ms; block 128 or 256).
+- Lowering VB-Cable's "Max Latency" from 7168 to 2048 samples (with a reboot) changed nothing: it is an upper bound, not the working buffer.
+- Other host APIs on the same loop: WDM-KS 42–45 ms at 48 kHz (33–36 ms at 44.1 kHz); MME 170–190 ms; DirectSound 208–228 ms.
+
+### M1: Latency target relaxed from < 40 ms to < 70 ms
+With VB-Cable in the path, ~40 ms is the floor even on WDM-KS at 48 kHz with no effects, so < 40 ms is not reachable once pitch shift (~10 ms) is added. Decision: keep WASAPI (WDM-KS is fragile in PortAudio, locks devices, and saves only ~12 ms) and set the target to **< 70 ms added latency**. Measured: ~55 ms passthrough and ~65 ms with pitch shift using `--exclusive-mic`; ~70–80 ms passthrough in the default shared-mic mode. A WDM-KS backend (and 44.1 kHz) remains a possible future optimisation.
 
 ## Goals (v1)
 
-- Real-time mic → effects → virtual cable with **< 40 ms added latency** (ideal < 25 ms)
+- Real-time mic → effects → virtual cable with **< 70 ms added latency**, VB-Cable included (relaxed from < 40 ms in M1; see Decisions log)
 - 6 built-in presets + adjustable sliders + saveable custom presets
 - Global hotkeys: bypass toggle and preset cycling
 - Monitor mode (hear yourself in headphones)
@@ -110,7 +118,7 @@ class Effect:
 
 | Requirement | Target |
 | --- | --- |
-| Added latency | < 40 ms, measured and shown in UI |
+| Added latency | < 70 ms including VB-Cable, measured and shown in UI (see Decisions log) |
 | Underruns | 0 in 60 minutes at default block size |
 | CPU (classic effects) | < 10% of one core on a mid-range PC |
 | CPU (bypassed or Clean preset) | < 3% of one core, so it can run all day alongside video calls |
@@ -219,7 +227,7 @@ Build `core/engine.py` with a full-duplex `sounddevice` stream (WASAPI) from the
 
 ### M1: Classic effects
 Effect interface, chain, noise gate, pitch shift, robot, radio, limiter. Offline tests. Choose the pitch-shift implementation (own phase vocoder/PSOLA vs `pedalboard`) based on latency and license, and record the decision in this file.
-**Done when:** effects switchable via CLI flag, tests pass, latency < 40 ms.
+**Done when:** effects switchable via CLI flag, tests pass, latency < 70 ms (relaxed from < 40 ms; see Decisions log).
 
 ### M2: UI + presets
 PySide6 window (FR10–FR13), presets (FR5–FR7) including the Clean preset, settings persistence, start-with-Windows option. Audio stays on its own thread.
