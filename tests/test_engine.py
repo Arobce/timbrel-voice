@@ -85,3 +85,89 @@ def test_not_running_before_start():
     engine = make_engine()
     assert not engine.running
     assert engine.latency_ms is None
+
+
+# --- monitor ring buffer and monitor-only mode --------------------------------
+
+from timbrel.core.engine import MonitorRing  # noqa: E402
+
+
+def test_ring_round_trip():
+    ring = MonitorRing(size=1024, max_fill=512)
+    ring.write(np.arange(100, dtype=np.float32))
+    out = np.empty(100, np.float32)
+    assert ring.read(out)
+    np.testing.assert_array_equal(out, np.arange(100))
+
+
+def test_ring_underflow_pads_with_silence():
+    ring = MonitorRing(size=1024, max_fill=512)
+    ring.write(np.ones(30, np.float32))
+    out = np.full(50, 9.0, np.float32)
+    assert not ring.read(out)
+    assert np.all(out[:30] == 1.0) and np.all(out[30:] == 0.0)
+
+
+def test_ring_wraps_around():
+    ring = MonitorRing(size=64, max_fill=64)
+    out = np.empty(40, np.float32)
+    for k in range(10):
+        block = np.full(40, k, np.float32)
+        ring.write(block)
+        assert ring.read(out)
+        assert np.all(out == k)
+
+
+def test_ring_skips_ahead_when_backed_up():
+    ring = MonitorRing(size=4096, max_fill=256)
+    for k in range(10):
+        ring.write(np.full(100, k, np.float32))
+    out = np.empty(100, np.float32)
+    ring.read(out)
+    # Old audio is dropped so monitor latency stays bounded.
+    assert out[-1] == 9.0
+
+
+def test_monitor_receives_processed_audio():
+    engine = Engine(EngineConfig(input_device=0, output_device=1, monitor_device=2))
+    engine._monitor = object()  # pretend the monitor stream is open
+    engine.set_monitor(True)
+    blocks = [np.full((256, 1), k / 10, np.float32) for k in range(6)]
+    for block in blocks:  # enough to fill the ~20 ms cushion
+        run_block(engine, block, 2)
+    out = np.zeros((256, 2), np.float32)
+    engine._monitor_callback(out, 256, None, sd.CallbackFlags())
+    # Plays the oldest queued block first, on every channel.
+    np.testing.assert_array_equal(out[:, 0], blocks[0][:, 0])
+    np.testing.assert_array_equal(out[:, 1], blocks[0][:, 0])
+    assert engine.stats.monitor_underflows == 0
+
+
+def test_monitor_disabled_outputs_silence():
+    engine = Engine(EngineConfig(input_device=0, output_device=1, monitor_device=2))
+    engine._monitor = object()
+    run_block(engine, np.ones((256, 1), np.float32), 2)
+    out = np.full((256, 2), 7.0, np.float32)
+    engine._monitor_callback(out, 256, None, sd.CallbackFlags())
+    assert np.all(out == 0.0)
+
+
+def test_input_only_callback_updates_meters():
+    engine = Engine(EngineConfig(input_device=0, output_device=None))
+    indata = np.zeros((256, 1), np.float32)
+    indata[10] = -0.75
+    engine._input_callback(indata, 256, None, sd.CallbackFlags())
+    assert engine.stats.input_peak == pytest.approx(0.75)
+    assert engine.stats.output_peak == pytest.approx(0.75)
+    assert engine.stats.blocks == 1
+
+
+def test_ring_prebuffers_before_playing():
+    ring = MonitorRing(size=1024, max_fill=512, prebuffer=150)
+    out = np.full(100, 9.0, np.float32)
+    ring.write(np.ones(100, np.float32))
+    assert ring.read(out)  # cushion not full yet: silence, not a dropout
+    assert np.all(out == 0.0)
+    ring.write(np.ones(100, np.float32))
+    assert ring.read(out)
+    assert np.all(out == 1.0)

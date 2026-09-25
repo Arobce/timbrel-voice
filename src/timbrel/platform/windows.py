@@ -7,8 +7,12 @@ without audio hardware.
 
 from __future__ import annotations
 
+import os
+import sys
+import winreg
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import sounddevice as sd
@@ -164,6 +168,13 @@ def resolve_device(spec: str | None, direction: Direction, wasapi: WasapiDevices
     raise DeviceError(f"{spec!r} matches several {direction} devices: {names}. Use the index.")
 
 
+def find_by_name(name: str | None, direction: Direction, wasapi: WasapiDevices) -> Device | None:
+    """The device with exactly this name (as saved in settings), if present."""
+    if not name:
+        return None
+    return next((d for d in wasapi.of(direction) if d.name == name), None)
+
+
 def query_wasapi_devices() -> WasapiDevices:
     return wasapi_devices(sd.query_devices(), sd.query_hostapis())
 
@@ -185,3 +196,46 @@ def stream_settings(device: Device | None = None, exclusive: bool = False) -> sd
 
 def shared_settings() -> sd.WasapiSettings:
     return sd.WasapiSettings(auto_convert=True)
+
+
+# --- app data and start with Windows ------------------------------------------
+
+APP_NAME = "Timbrel"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def app_data_dir() -> Path:
+    r"""%APPDATA%\Timbrel (settings.json and presets\)."""
+    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(base) / APP_NAME
+
+
+def autostart_command(preset: str = "Clean") -> str:
+    """Command line that launches Timbrel minimized to the tray."""
+    args = f'--minimized --preset "{preset}"'
+    if getattr(sys, "frozen", False):  # PyInstaller build
+        return f'"{sys.executable}" {args}'
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")  # no console window
+    return f'"{pythonw if pythonw.exists() else exe}" -m timbrel {args}'
+
+
+def set_autostart(enabled: bool, command: str | None = None) -> None:
+    """Add or remove Timbrel from the current user's startup programs."""
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command or autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+            return True
+    except FileNotFoundError:
+        return False
