@@ -106,6 +106,60 @@ class NoiseGate(Effect):
         return block
 
 
+class Compressor(Effect):
+    """Evens out loud and quiet speech, with automatic makeup gain.
+
+    Detects RMS once per block, smooths the gain reduction with attack and
+    release times, and ramps the gain across each block. Makeup gain restores
+    half the reduction a full-scale signal would get, so levels stay similar
+    to the dry voice.
+    """
+
+    name = "compressor"
+    PARAMS: Mapping[str, ParamSpec] = {
+        "threshold_db": ParamSpec(-24.0, -50.0, 0.0, "dB"),
+        "ratio": ParamSpec(3.0, 1.0, 10.0, ":1"),
+    }
+    ATTACK_MS = 8.0
+    RELEASE_MS = 150.0
+
+    def __init__(self, sample_rate: int, block_size: int) -> None:
+        super().__init__(sample_rate, block_size)
+        self._ramp = _GainRamp(block_size)
+        self._attack = sample_rate * self.ATTACK_MS / 1000
+        self._release = sample_rate * self.RELEASE_MS / 1000
+        self.reset()
+
+    def reset(self) -> None:
+        self._reduction_db = 0.0
+        self._gain = 1.0
+
+    @property
+    def gain_reduction_db(self) -> float:
+        return self._reduction_db
+
+    def _apply_params(self, params: Mapping[str, float]) -> None:
+        self._threshold = params["threshold_db"]
+        self._slope = 1.0 - 1.0 / params["ratio"]
+        self._makeup_db = -self._threshold * self._slope / 2.0
+
+    def _process(self, block: np.ndarray) -> np.ndarray:
+        n = len(block)
+        if n == 0:
+            return block
+        rms = math.sqrt(float(np.dot(block, block)) / n)
+        level_db = 20.0 * math.log10(max(rms, 1e-9))
+        target = max(0.0, level_db - self._threshold) * self._slope
+        time = self._attack if target > self._reduction_db else self._release
+        coeff = math.exp(-n / time)
+        self._reduction_db = target + (self._reduction_db - target) * coeff
+        start = self._gain
+        end = 10.0 ** ((self._makeup_db - self._reduction_db) / 20.0)
+        self._gain = end
+        self._ramp.apply(block, start, end)
+        return block
+
+
 class Limiter(Effect):
     """Keeps the output below the ceiling. Always last in the chain.
 

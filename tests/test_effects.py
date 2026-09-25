@@ -7,7 +7,17 @@ import pytest
 from scipy.io import wavfile
 
 from timbrel.core.chain import EffectChain
-from timbrel.core.effects import EFFECTS, Limiter, NoiseGate, PitchShift, Radio, Robot
+from timbrel.core.effects import (
+    EFFECTS,
+    Compressor,
+    Echo,
+    Eq,
+    Limiter,
+    NoiseGate,
+    PitchShift,
+    Radio,
+    Robot,
+)
 from timbrel.core.params import SmoothedValue
 
 SR = 48_000
@@ -298,3 +308,79 @@ def test_smoothed_value_ramps_then_settles():
     assert second[35] == pytest.approx(1.0)
     assert second[-1] == 1.0
     assert value.next_block(64) == 1.0
+
+
+# --- eq ----------------------------------------------------------------------
+
+
+def _eq(**params) -> Eq:
+    eq = Eq(SR, BLOCK)
+    eq.set_params(**params)
+    return eq
+
+
+def test_eq_low_cut_removes_rumble():
+    rumble = band_rms(run(_eq(low_cut_hz=80), sine(30, amp=0.3))[SR // 5 :])
+    voice_band = band_rms(run(_eq(low_cut_hz=80), sine(300, amp=0.3))[SR // 5 :])
+    assert rumble < 0.3 / np.sqrt(2) * 0.2
+    assert voice_band == pytest.approx(0.3 / np.sqrt(2), rel=0.05)
+
+
+@pytest.mark.parametrize("gain_db", [-6.0, 2.0, 6.0])
+def test_eq_presence_boost(gain_db):
+    out = run(_eq(low_cut_hz=20, presence_db=gain_db), sine(3500, amp=0.1))[SR // 5 :]
+    measured = 20 * np.log10(band_rms(out) / (0.1 / np.sqrt(2)))
+    assert measured == pytest.approx(gain_db, abs=0.3)
+
+
+# --- compressor --------------------------------------------------------------
+
+
+def test_compressor_reduces_dynamic_range():
+    comp = Compressor(SR, BLOCK)
+    comp.set_params(threshold_db=-30, ratio=4)
+    quiet = band_rms(run(comp, sine(300, amp=0.03))[SR // 2 :])
+    comp.reset()
+    loud = band_rms(run(comp, sine(300, amp=0.6))[SR // 2 :])
+    # 26 dB input difference -> much less at the output.
+    out_range = 20 * np.log10(loud / quiet)
+    assert out_range < 15
+
+
+def test_compressor_ratio_one_is_unity_after_makeup():
+    comp = Compressor(SR, BLOCK)
+    comp.set_params(ratio=1.0)
+    tone = sine(300, amp=0.5)
+    np.testing.assert_allclose(run(comp, tone), tone, atol=1e-6)
+
+
+# --- echo --------------------------------------------------------------------
+
+
+def test_echo_repeats_after_delay_time():
+    echo = Echo(SR, BLOCK)
+    echo.set_params(time_ms=100, feedback=0.0, mix=0.5)
+    click = np.zeros(SR, np.float32)
+    click[1000] = 1.0
+    out = run(echo, click)
+    assert out[1000] == pytest.approx(1.0)
+    repeat = out[1000 + 4800 - 5 : 1000 + 4800 + 5]
+    assert np.abs(repeat).max() > 0.3
+    assert np.abs(out[1000 + 9600 - 50 :]).max() < 1e-6  # no feedback: single repeat
+
+
+def test_echo_feedback_decays():
+    echo = Echo(SR, BLOCK)
+    echo.set_params(time_ms=100, feedback=0.5, mix=1.0)
+    click = np.zeros(SR, np.float32)
+    click[1000] = 1.0
+    out = run(echo, click)
+    peaks = [np.abs(out[1000 + k * 4800 - 20 : 1000 + k * 4800 + 20]).max() for k in (1, 2, 3)]
+    assert peaks[0] > peaks[1] > peaks[2] > 0
+
+
+def test_echo_mix_zero_is_dry():
+    echo = Echo(SR, BLOCK)
+    echo.set_params(mix=0.0)
+    tone = sine(300)
+    np.testing.assert_allclose(run(echo, tone), tone, atol=1e-6)
