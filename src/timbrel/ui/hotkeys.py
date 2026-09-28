@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
@@ -29,6 +29,7 @@ ACTION_LABELS = {
     "next_preset": "Next preset",
 }
 DEBOUNCE_SECONDS = 0.25  # key auto-repeat must not flip bypass back and forth
+HOOK_REINSTALL_MS = 30_000
 
 # Qt's names for keys -> ours (platform.windows.KEY_CODES).
 _QT_TO_KEYBOARD = {
@@ -77,6 +78,11 @@ class HotkeyBridge(QObject):
         }
         self.triggered.connect(self._run, Qt.ConnectionType.QueuedConnection)
         self.bind()
+        # Windows drops a slow low-level hook without telling anyone;
+        # re-installing it regularly means a dropped hook heals itself.
+        self._heal_timer = QTimer(self)
+        self._heal_timer.timeout.connect(self.hotkeys.reinstall)
+        self._heal_timer.start(HOOK_REINSTALL_MS)
 
     def bind(self) -> list[str]:
         bindings = {}
@@ -94,6 +100,7 @@ class HotkeyBridge(QObject):
         self._actions[action]()
 
     def close(self) -> None:
+        self._heal_timer.stop()
         self.hotkeys.clear()
 
 

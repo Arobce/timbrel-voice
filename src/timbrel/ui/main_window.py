@@ -403,7 +403,10 @@ class MainWindow(QMainWindow):
         if status.running:
             mic = "exclusive mic" if status.mic_exclusive else "shared mic"
             latency = f"~{status.latency_ms:.0f} ms (estimate)" if status.latency_ms else "–"
-            self.status_label.setText(f"Latency {latency} · Dropouts {status.xruns} · {mic}")
+            text = f"Latency {latency} · Dropouts {status.xruns} · {mic}"
+            if status.monitor_note:
+                text += f"\n⚠ {status.monitor_note}"
+            self.status_label.setText(text)
         else:
             self.status_label.setText("Audio stopped")
 

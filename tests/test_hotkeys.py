@@ -31,6 +31,9 @@ class FakeGlobalHotkeys:
     def clear(self):
         self.bound = {}
 
+    def reinstall(self):
+        self.reinstalls = getattr(self, "reinstalls", 0) + 1
+
     def press(self, hotkey, from_thread=True):
         callback = self.bound[hotkey]
         if from_thread:

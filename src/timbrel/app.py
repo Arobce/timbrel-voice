@@ -98,6 +98,7 @@ class Status:
     xruns: int
     input_peak: float
     output_peak: float
+    monitor_note: str | None = None  # why monitoring isn't playing, if it should be
 
 
 class Controller:
@@ -121,6 +122,9 @@ class Controller:
         self._clock = clock or time.monotonic
         self._last_blocks: int | None = None
         self._stalls = 0
+        self._last_monitor_blocks: int | None = None
+        self._monitor_stalls = 0
+        self.monitor_note: str | None = None
         self._next_retry = 0.0
         self.devices_version = 0
         self._player = player or SoundDevicePlayer()
@@ -240,6 +244,8 @@ class Controller:
         self._mic, self._out = mic, out
         self._mic_exclusive = _is_exclusive(used.input_settings)
         self._last_blocks, self._stalls = None, 0
+        self._last_monitor_blocks, self._monitor_stalls = None, 0
+        self.monitor_note = self._monitor_problem(monitor, out)
         # Remember what was opened (FR1), so an unplug pauses rather than switches.
         changed = self.settings.input_device != mic.name
         self.settings.input_device = mic.name
@@ -252,21 +258,27 @@ class Controller:
         self._notify()
         return True
 
+    def _monitor_problem(
+        self, monitor: windows.Device | None, out: windows.Device | None
+    ) -> str | None:
+        """Why the monitor isn't playing although it's switched on, if so."""
+        if not self.settings.monitor_enabled or out is None:
+            return None
+        if self.settings.monitor_device and monitor is None:
+            problem = f"Monitor device “{self.settings.monitor_device}” isn't connected"
+        elif self.engine is not None and self.engine.monitor_error:
+            problem = f"Monitor couldn't start: {self.engine.monitor_error}"
+        else:
+            return None
+        return problem + ". Untick and tick Monitor to retry."
+
     def poll(self) -> None:
         """Call about twice a second from the UI thread. Detects a device that
         stopped delivering audio (unplugged) and retries a paused engine."""
         if self._test_playing and not self._player.playing:
             self._end_test_playback()
-        engine = self.engine
-        if engine is not None:
-            blocks = engine.stats.blocks
-            self._stalls = self._stalls + 1 if blocks == self._last_blocks else 0
-            self._last_blocks = blocks
-            if not engine.running or self._stalls >= STALL_POLLS:
-                self.stop()
-                self.error = "Audio device stopped responding (unplugged?)"
-                self._next_retry = self._clock() + RETRY_SECONDS
-                self._notify()
+        if self.engine is not None:
+            self._check_engine(self.engine)
             return
         if self.error is not None and self._clock() >= self._next_retry:
             try:
@@ -275,6 +287,29 @@ class Controller:
                 self.error = str(exc)
                 self._next_retry = self._clock() + RETRY_SECONDS
                 return
+            self.start()
+
+    def _check_engine(self, engine: Engine) -> None:
+        blocks = engine.stats.blocks
+        self._stalls = self._stalls + 1 if blocks == self._last_blocks else 0
+        self._last_blocks = blocks
+        if not engine.running or self._stalls >= STALL_POLLS:
+            self.stop()
+            self.error = "Audio device stopped responding (unplugged?)"
+            self._next_retry = self._clock() + RETRY_SECONDS
+            self._notify()
+            return
+        if not (engine.has_monitor and engine.monitor_enabled):
+            return
+        # Headphones unplugged: the main path keeps running but the monitor
+        # stream goes silent. Restart to reopen it or report it missing.
+        mblocks = engine.stats.monitor_blocks
+        same = mblocks == self._last_monitor_blocks
+        self._monitor_stalls = self._monitor_stalls + 1 if same else 0
+        self._last_monitor_blocks = mblocks
+        if self._monitor_stalls >= STALL_POLLS:
+            self.stop()
+            self.refresh_devices()
             self.start()
 
     def stop(self) -> None:
@@ -333,6 +368,7 @@ class Controller:
             xruns=stats.xruns if stats else 0,
             input_peak=stats.input_peak if stats and running else 0.0,
             output_peak=stats.output_peak if stats and running else 0.0,
+            monitor_note=self.monitor_note if running else None,
         )
 
     # --- presets and effects -------------------------------------------------

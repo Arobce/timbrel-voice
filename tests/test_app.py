@@ -22,6 +22,7 @@ class FakeEngine:
         self.stats = StreamStats()
         self.monitor_enabled = False
         self.output_muted = False
+        self.monitor_error = None
         self._running = False
         self._capture = None
         self.capture_progress = None
@@ -397,3 +398,51 @@ def test_stop_playback_unmutes(tmp_path):
     c.stop_test_playback()
     assert not player.playing
     assert not c.engine.output_muted
+
+
+# --- monitor problems -------------------------------------------------------------
+
+
+def test_missing_monitor_device_is_reported_but_audio_runs(tmp_path):
+    settings = Settings(monitor_enabled=True, monitor_device="Unplugged Headphones")
+    c = make_controller(tmp_path, settings=settings)
+    assert c.start()
+    status = c.status()
+    assert status.running
+    assert "Unplugged Headphones" in status.monitor_note
+    assert "retry" in status.monitor_note
+
+
+def test_monitor_that_failed_to_open_is_reported(tmp_path, monkeypatch):
+    settings = Settings(monitor_enabled=True, monitor_device="Headphones (USB Mic)")
+    c = make_controller(tmp_path, settings=settings)
+    original = FakeEngine.start
+
+    def start_without_monitor(self):
+        original(self)
+        self.monitor_error = "Device unavailable"
+
+    monkeypatch.setattr(FakeEngine, "start", start_without_monitor)
+    c.start()
+    assert "Device unavailable" in c.status().monitor_note
+
+
+def test_no_monitor_note_when_monitor_is_off(tmp_path):
+    c = make_controller(tmp_path, settings=Settings(monitor_device="Unplugged Headphones"))
+    c.start()
+    assert c.status().monitor_note is None
+
+
+def test_silent_monitor_is_restarted(tmp_path):
+    c, state, clock = make_pluggable(
+        tmp_path, settings=Settings(monitor_enabled=True, monitor_device="Headphones (USB Mic)")
+    )
+    c.start()
+    first = c.engine
+    first.set_monitor(True)
+    for _ in range(4):
+        first.stats.blocks += 90  # main audio keeps flowing
+        c.poll()  # monitor_blocks never moves: headphones gone
+    assert c.engine is not first  # restarted
+    assert c.engine.running
+    assert c.error is None

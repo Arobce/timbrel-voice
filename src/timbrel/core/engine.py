@@ -63,6 +63,7 @@ class StreamStats:
         self.output_overflows = 0
         self.output_underflows = 0
         self.monitor_underflows = 0
+        self.monitor_blocks = 0  # monitor callbacks so far (to spot a dead monitor)
         self.blocks = 0
         self.input_peak = 0.0
         self.output_peak = 0.0
@@ -165,6 +166,7 @@ class Engine:
         )
         self._stream: sd.Stream | sd.InputStream | None = None
         self._monitor: sd.OutputStream | None = None
+        self.monitor_error: str | None = None  # why the monitor couldn't open
 
     # --- audio threads -----------------------------------------------------
 
@@ -218,6 +220,7 @@ class Engine:
     def _monitor_callback(
         self, outdata: np.ndarray, frames: int, time: Any, status: sd.CallbackFlags
     ) -> None:
+        self.stats.monitor_blocks += 1
         mono = self._monitor_buf[:frames]
         if not self.monitor_enabled:
             outdata.fill(0.0)
@@ -254,33 +257,51 @@ class Engine:
                 callback=self._input_callback,
                 **common,
             )
-        monitor = None
-        if cfg.monitor_device is not None:
-            monitor = sd.OutputStream(
-                device=cfg.monitor_device,
-                channels=cfg.monitor_channels,
-                extra_settings=cfg.monitor_settings,
-                callback=self._monitor_callback,
-                **common,
-            )
         try:
-            if monitor is not None:
-                monitor.start()
             stream.start()
         except BaseException:
-            for s in (stream, monitor):
-                if s is not None:
-                    s.close()
+            stream.close()
             raise
-        self._stream, self._monitor = stream, monitor
+        self._stream = stream
+        # The monitor is optional: if the headphones can't be opened (busy,
+        # unplugged), keep the main path running and say why.
+        self.monitor_error = None
+        if cfg.monitor_device is not None:
+            try:
+                monitor = sd.OutputStream(
+                    device=cfg.monitor_device,
+                    channels=cfg.monitor_channels,
+                    extra_settings=cfg.monitor_settings,
+                    callback=self._monitor_callback,
+                    **common,
+                )
+            except sd.PortAudioError as exc:
+                self.monitor_error = str(exc)
+                return
+            try:
+                monitor.start()
+            except sd.PortAudioError as exc:
+                self.monitor_error = str(exc)
+                monitor.close()
+                return
+            self._monitor = monitor
 
     def stop(self) -> None:
         stream, self._stream = self._stream, None
         monitor, self._monitor = self._monitor, None
         for s in (stream, monitor):
-            if s is not None:
+            if s is None:
+                continue
+            # After an unplug, stop() can fail; still close every stream so
+            # no device handle is left open for the next start.
+            try:
                 s.stop()
+            except sd.PortAudioError:
+                pass
+            try:
                 s.close()
+            except sd.PortAudioError:
+                pass
         self._ring.clear()
 
     def start_capture(self, seconds: float) -> None:

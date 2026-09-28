@@ -203,3 +203,82 @@ def test_muted_output_is_silent_but_meters_still_work():
     out = run_block(engine, np.full((256, 1), 0.5, np.float32), 2)
     assert np.all(out == 0.0)
     assert engine.stats.input_peak == pytest.approx(0.5)
+
+
+# --- device failures (fake PortAudio streams) --------------------------------------
+
+
+class FakeStream:
+    instances: list = []
+
+    def __init__(self, fail_open=False, fail_start=False, fail_stop=False, **kwargs):
+        if fail_open:
+            raise sd.PortAudioError("Device unavailable")
+        self.kwargs = kwargs
+        self.fail_start, self.fail_stop = fail_start, fail_stop
+        self.active = False
+        self.closed = False
+        self.latency = (0.01, 0.01)
+        FakeStream.instances.append(self)
+
+    def start(self):
+        if self.fail_start:
+            raise sd.PortAudioError("Device unavailable")
+        self.active = True
+
+    def stop(self):
+        if self.fail_stop:
+            raise sd.PortAudioError("Device was removed")
+        self.active = False
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_streams(monkeypatch):
+    FakeStream.instances = []
+    behaviour = {"main": {}, "monitor": {}}
+    monkeypatch.setattr(sd, "Stream", lambda **kw: FakeStream(**behaviour["main"], **kw))
+    monkeypatch.setattr(sd, "OutputStream", lambda **kw: FakeStream(**behaviour["monitor"], **kw))
+    return behaviour
+
+
+def monitor_engine():
+    return Engine(EngineConfig(input_device=0, output_device=1, monitor_device=2))
+
+
+@pytest.mark.parametrize("failure", ["fail_open", "fail_start"])
+def test_bad_monitor_device_keeps_main_audio_running(fake_streams, failure):
+    fake_streams["monitor"] = {failure: True}
+    engine = monitor_engine()
+    engine.start()
+    assert engine.running
+    assert not engine.has_monitor
+    assert "Device unavailable" in engine.monitor_error
+
+
+def test_bad_main_device_still_fails(fake_streams):
+    fake_streams["main"] = {"fail_start": True}
+    with pytest.raises(sd.PortAudioError):
+        monitor_engine().start()
+    assert all(s.closed for s in FakeStream.instances)
+
+
+def test_stop_closes_every_stream_even_if_stopping_fails(fake_streams):
+    fake_streams["main"] = {"fail_stop": True}  # e.g. just after an unplug
+    fake_streams["monitor"] = {"fail_stop": True}
+    engine = monitor_engine()
+    engine.start()
+    engine.stop()
+    assert len(FakeStream.instances) == 2
+    assert all(s.closed for s in FakeStream.instances)
+    assert not engine.running
+
+
+def test_monitor_callbacks_are_counted():
+    engine = monitor_engine()
+    out = np.zeros((256, 2), np.float32)
+    for _ in range(3):
+        engine._monitor_callback(out, 256, None, sd.CallbackFlags())
+    assert engine.stats.monitor_blocks == 3

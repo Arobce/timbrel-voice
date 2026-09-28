@@ -309,6 +309,9 @@ class HotkeyMatcher:
     def set_bindings(self, bindings: Mapping[str, Callable[[], None]]) -> None:
         self.bindings = {parse_hotkey(k): cb for k, cb in bindings.items()}
 
+    def reset_held(self) -> None:
+        self._held = set()
+
     def feed(self, vk: int, down: bool) -> Callable[[], None] | None:
         """Process one key event; returns the callback to run, if any."""
         if not down:
@@ -361,6 +364,20 @@ class GlobalHotkeys:
 
     def clear(self) -> None:
         self.matcher.set_bindings({})
+        self._stop()
+
+    def reinstall(self) -> None:
+        """Re-install the hook with the same hotkeys. Windows silently removes
+        a low-level hook that is ever slow to answer (Python can be, while
+        other threads hold the interpreter), so the app calls this
+        periodically to heal a dropped hook within seconds."""
+        if self._thread is None or not self.matcher.bindings:
+            return
+        self._stop()
+        self.matcher.reset_held()  # keys released during the gap
+        self._start()
+
+    def _stop(self) -> None:
         if self._thread is not None:
             ctypes.windll.user32.PostThreadMessageW(self._thread_id, self.WM_QUIT, 0, 0)
             self._thread.join(timeout=2)
