@@ -16,7 +16,7 @@ def test_defaults_when_missing(tmp_path):
 def test_round_trip(tmp_path):
     path = tmp_path / "Timbrel" / "settings.json"
     original = Settings(
-        input_device="Microphone (fifine Microphone)",
+        input_device="Microphone (USB Audio Device)",
         monitor_enabled=True,
         block_size=512,
         preset="Robot",

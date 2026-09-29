@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Pull requests from forks run this too once the repo is public: read-only.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: windows-latest
