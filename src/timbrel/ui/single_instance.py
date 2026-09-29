@@ -8,6 +8,7 @@ later launches send it "show", wait for its "ok", and exit.
 from __future__ import annotations
 
 import getpass
+import time
 from collections.abc import Callable
 from functools import partial
 
@@ -22,21 +23,26 @@ def server_name() -> str:
     return f"timbrel-{getpass.getuser()}"
 
 
-def notify_running_instance(name: str | None = None) -> bool:
+def notify_running_instance(name: str | None = None, retry_seconds: float = 0.0) -> bool:
     """True if another copy is running (and was asked to show itself).
 
     Waits for the running copy to acknowledge: closing the socket straight
-    after writing can drop the message before it's read.
+    after writing can drop the message before it's read. With
+    ``retry_seconds``, keeps trying while that copy is still starting up.
     """
-    socket = QLocalSocket()
-    socket.connectToServer(name or server_name())
-    if not socket.waitForConnected(CONNECT_TIMEOUT_MS):
-        return False
-    socket.write(b"show\n")
-    socket.waitForBytesWritten(CONNECT_TIMEOUT_MS)  # on Windows the write needs this
-    socket.waitForReadyRead(ACK_TIMEOUT_MS)
-    socket.abort()
-    return True
+    deadline = time.monotonic() + retry_seconds
+    while True:
+        socket = QLocalSocket()
+        socket.connectToServer(name or server_name())
+        if socket.waitForConnected(CONNECT_TIMEOUT_MS):
+            socket.write(b"show\n")
+            socket.waitForBytesWritten(CONNECT_TIMEOUT_MS)  # on Windows the write needs this
+            socket.waitForReadyRead(ACK_TIMEOUT_MS)
+            socket.abort()
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 class InstanceServer(QObject):

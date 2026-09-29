@@ -243,6 +243,38 @@ def autostart_enabled() -> bool:
         return False
 
 
+ERROR_ALREADY_EXISTS = 183
+
+
+class InstanceLock:
+    """A named mutex that marks "Timbrel is running" for this user session.
+
+    Claiming it is instant and atomic, so two launches racing each other can't
+    both win; Windows releases it when the process exits, even after a crash.
+    """
+
+    def __init__(self, name: str) -> None:
+        from ctypes import wintypes as wt
+
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateMutexW.restype = wt.HANDLE
+        self._kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+        self._kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        handle = self._kernel32.CreateMutexW(None, False, f"Local\\{name}")
+        already = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+        if handle and already:
+            self._kernel32.CloseHandle(handle)
+            handle = None
+        # If the mutex can't be created at all, don't block startup.
+        self.acquired = bool(handle) or not already
+        self._handle = handle
+
+    def release(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
 def rescan_devices() -> WasapiDevices:
     """Re-read the device list. PortAudio caches it at startup, so plugging a
     device back in is only seen after re-initialising. No streams may be open."""
