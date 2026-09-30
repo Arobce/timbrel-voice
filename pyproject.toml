@@ -21,6 +21,13 @@ dev = [
     "pytest>=8",
     "ruff>=0.5",
 ]
+# Optional AI Voice mode (experimental): NVIDIA GPU with CUDA required.
+# onnxruntime-gpu and faiss-cpu are MIT; the [cuda,cudnn] extra pulls
+# NVIDIA's runtime wheels so no separate CUDA install is needed.
+ai = [
+    "onnxruntime-gpu[cuda,cudnn]>=1.30",
+    "faiss-cpu>=1.8",
+]
 # PyInstaller is only a build tool: its bootloader license (GPL with an
 # exception) allows distributing the built app under our own license.
 build = [
