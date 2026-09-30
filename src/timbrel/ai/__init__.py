@@ -13,6 +13,10 @@ from pathlib import Path
 
 from timbrel.platform import windows
 
+# The AI voice wants a gentler gate than the classic presets: quiet syllables
+# gated to silence come out unvoiced (measured: -50 dB lost ~5% more voicing).
+AI_GATE = {"threshold_db": -55.0, "release_ms": 250.0}
+
 
 def ai_dir() -> Path:
     """Base models (HuBERT, RMVPE)."""

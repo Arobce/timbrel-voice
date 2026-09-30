@@ -68,6 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-effects", action="store_true", help="list effects and their parameters and exit"
     )
+    ai = parser.add_argument_group('AI voice (experimental; needs pip install -e ".[ai]")')
+    ai.add_argument("--ai-voice", metavar="NAME", help="convert your voice with this AI voice")
+    ai.add_argument(
+        "--ai-shift", type=float, default=0.0, metavar="ST", help="AI voice pitch shift, semitones"
+    )
+    ai.add_argument(
+        "--ai-index-rate",
+        type=float,
+        default=0.5,
+        metavar="R",
+        help="0-1: how strongly to sound like the voice (high values can garble words)",
+    )
+    ai.add_argument("--list-voices", action="store_true", help="list AI voices and exit")
     gui = parser.add_argument_group("window")
     gui.add_argument(
         "--no-gui", action="store_true", help="run in the terminal (implied by the audio options)"
@@ -86,6 +99,7 @@ def wants_cli(args: argparse.Namespace) -> bool:
         or args.effect
         or args.gate
         or args.exclusive_mic
+        or args.ai_voice
         or args.block_size != DEFAULT_BLOCK_SIZE
     )
 
@@ -157,9 +171,47 @@ def format_device_list(wasapi: windows.WasapiDevices) -> str:
     return "\n".join(lines).rstrip()
 
 
+def format_voice_list() -> str:
+    from timbrel.ai import ai_dir, list_voices, voices_dir
+    from timbrel.ai.runtime import HUBERT_FILE, RMVPE_FILE, AiUnavailable, check_runtime
+
+    lines = [f"AI voices in {voices_dir()}:"]
+    voices = list_voices()
+    lines += [f"  {v.name}{'  (+ index)' if v.index else ''}" for v in voices] or ["  (none)"]
+    missing = [f for f in (HUBERT_FILE, RMVPE_FILE) if not (ai_dir() / f).exists()]
+    if missing:
+        lines.append(f"Missing base models in {ai_dir()}: {', '.join(missing)}")
+    try:
+        lines.append(f"Runtime: {check_runtime()}")
+    except AiUnavailable as exc:
+        lines.append(f"Not available: {exc}")
+    return "\n".join(lines)
+
+
+def load_ai_voice(args: argparse.Namespace, block_size: int) -> Effect:
+    from timbrel.ai import list_voices, load_voice
+
+    voices = {v.name.lower(): v for v in list_voices()}
+    voice = voices.get(args.ai_voice.lower())
+    if voice is None:
+        raise ValueError(f"no AI voice called {args.ai_voice!r}; see --list-voices")
+    print(f"Loading AI voice {voice.name} on the GPU...")
+    effect = load_voice(voice, DEFAULT_SAMPLE_RATE, block_size)
+    effect.set_params(semitones=args.ai_shift, index_rate=args.ai_index_rate)
+    return effect
+
+
 def run(args: argparse.Namespace) -> int:
     block_size = args.block_size
     chain = build_chain(args.effect, args.gate, DEFAULT_SAMPLE_RATE, block_size)
+    ai_effect = None
+    if args.ai_voice:
+        from timbrel.ai import AI_GATE
+
+        ai_effect = load_ai_voice(args, block_size)
+        chain.set_effects([*chain.effects, ai_effect])
+        if not args.gate:
+            chain.gate.set_params(**AI_GATE)
     wasapi = windows.query_wasapi_devices()
     mic = windows.resolve_device(args.input, "input", wasapi)
     out = windows.resolve_device(args.output, "output", wasapi)
@@ -206,6 +258,8 @@ def run(args: argparse.Namespace) -> int:
         pass
     finally:
         engine.stop()
+        if ai_effect is not None:
+            ai_effect.close()
     print()
     stats = engine.stats
     print(
@@ -225,6 +279,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.list_effects:
             print(format_effect_list())
+            return 0
+        if args.list_voices:
+            print(format_voice_list())
             return 0
         if not wants_cli(args):
             from timbrel.ui import run_gui
