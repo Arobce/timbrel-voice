@@ -74,7 +74,12 @@ class ParamSlider(QWidget):
     changed = Signal(str, float)
 
     def __init__(
-        self, name: str, spec: ParamSpec, value: float, parent: QWidget | None = None
+        self,
+        name: str,
+        spec: ParamSpec,
+        value: float,
+        parent: QWidget | None = None,
+        label: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.name = name
@@ -84,7 +89,7 @@ class ParamSlider(QWidget):
         words = name.split("_")
         if words[-1] in ("db", "ms", "hz"):  # the unit is shown in the readout
             words = words[:-1]
-        label = QLabel(" ".join(words).replace("freq", "frequency"))
+        label = QLabel(label or " ".join(words).replace("freq", "frequency"))
         label.setMinimumWidth(96)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, self.STEPS)

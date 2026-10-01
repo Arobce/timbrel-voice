@@ -2,6 +2,7 @@
 
 import os
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -107,3 +108,103 @@ def test_param_slider_maps_range(qapp):
     slider = ParamSlider("semitones", ParamSpec(0, -12, 12, "st"), 5)
     assert slider.value() == pytest.approx(5, abs=0.03)
     assert slider.readout.text() == "5.0 st"
+
+
+# --- AI Voice panel -----------------------------------------------------------------
+
+import time  # noqa: E402
+
+from test_app import finish_fades, make_ai_controller, wait_for_ai  # noqa: E402
+
+
+@pytest.fixture
+def ai_window(qapp, tmp_path):
+    controller, loaded = make_ai_controller(tmp_path)
+    controller.start()
+    win = MainWindow(controller)
+    win.poll_timer.stop()
+    deadline = time.monotonic() + 3
+    while win.ai_panel._availability is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    win.tick()
+    yield win, loaded
+    win.timer.stop()
+    win.deleteLater()
+
+
+def test_ai_panel_lists_voices_and_is_ready(ai_window):
+    win, _ = ai_window
+    panel = win.ai_panel
+    assert [panel.voice_combo.itemText(i) for i in range(panel.voice_combo.count())] == [
+        "Fp231",
+        "Mp311",
+    ]
+    assert panel.enable.isEnabled()
+    assert not panel.enable.isChecked()
+    assert "Ready" in panel.status.text()
+
+
+def test_enabling_ai_loads_the_voice_and_updates_the_window(ai_window):
+    win, loaded = ai_window
+    panel = win.ai_panel
+    panel.voice_combo.setCurrentText("Mp311")
+    panel.enable.setChecked(True)
+    win.tick()
+    assert "Loading Mp311" in panel.status.text()
+    wait_for_ai(win.controller)
+    finish_fades(win.controller)
+    win.tick()
+    assert win.controller.ai_active
+    assert loaded[0].voice == "Mp311"
+    assert "On: Mp311" in panel.status.text()
+    assert not win.save_button.isEnabled()  # presets never hold an AI voice
+    assert not win.play_fx_button.isEnabled()
+
+
+def test_ai_sliders_change_the_live_voice_without_modifying_the_preset(ai_window):
+    win, loaded = ai_window
+    win.ai_panel.enable.setChecked(True)
+    wait_for_ai(win.controller)
+    win.ai_panel.pitch.slider.setValue(750)  # +12 st on a -24..24 range
+    win.controller.chain.process(np.zeros(256, np.float32))
+    assert loaded[0].params["semitones"] == pytest.approx(12, abs=0.1)
+    assert not win.controller.modified
+
+
+def test_picking_a_preset_turns_the_ai_checkbox_off(ai_window):
+    win, _ = ai_window
+    win.ai_panel.enable.setChecked(True)
+    wait_for_ai(win.controller)
+    win.preset_list.setCurrentRow(4)  # Robot
+    assert not win.ai_panel.enable.isChecked()
+    assert win.save_button.isEnabled()
+
+
+def test_quiet_mic_hint(ai_window):
+    win, loaded = ai_window
+    win.ai_panel.enable.setChecked(True)
+    wait_for_ai(win.controller)
+    loaded[0].input_gain_db = 30.0
+    win.tick()
+    assert "mic is very quiet" in win.ai_panel.status.text()
+
+
+def test_unavailable_ai_is_explained_and_disabled(qapp, tmp_path):
+    controller, _ = make_ai_controller(tmp_path)
+
+    def no_gpu():
+        raise RuntimeError("AI voice needs an NVIDIA GPU with CUDA; none was found.")
+
+    controller._ai_check = no_gpu
+    win = MainWindow(controller)
+    win.poll_timer.stop()
+    deadline = time.monotonic() + 3
+    while win.ai_panel._availability is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    win.tick()
+    try:
+        assert not win.ai_panel.enable.isEnabled()
+        assert "NVIDIA GPU" in win.ai_panel.status.text()
+    finally:
+        win.timer.stop()
+        win.deleteLater()

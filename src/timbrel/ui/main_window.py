@@ -31,6 +31,7 @@ from timbrel.app import VOICE_TEST_SECONDS, Controller
 from timbrel.core.effects import Effect
 from timbrel.platform.windows import VB_CABLE_URL
 from timbrel.presets import PresetError
+from timbrel.ui.ai_panel import AiPanel
 from timbrel.ui.hotkeys import ACTION_LABELS, HotkeyBridge, HotkeysDialog
 from timbrel.ui.widgets import BYPASS_COLOR, ON_COLOR, LevelMeter, ParamSlider, state_icon
 
@@ -88,6 +89,8 @@ class MainWindow(QMainWindow):
         middle.addWidget(self._build_effects(), 2)
         root.addLayout(middle, 1)
 
+        self.ai_panel = AiPanel(controller)
+        root.addWidget(self.ai_panel)
         root.addWidget(self._build_voice_test())
         root.addLayout(self._build_bottom())
         root.addWidget(self._build_settings())
@@ -204,7 +207,8 @@ class MainWindow(QMainWindow):
         running = self.controller.engine is not None
         self.record_button.setEnabled(running and state != "recording")
         self.record_progress.setValue(int(progress * 100))
-        self.play_fx_button.setEnabled(state in ("ready", "playing"))
+        ai = self.controller.ai_active
+        self.play_fx_button.setEnabled(state in ("ready", "playing") and not ai)
         self.play_raw_button.setEnabled(state in ("ready", "playing"))
         self.stop_test_button.setEnabled(state == "playing")
         hints = {
@@ -214,6 +218,11 @@ class MainWindow(QMainWindow):
             ". Plays on your monitor device (or speakers).",
             "playing": "Playing\u2026 apps hear silence from Timbrel until it finishes.",
         }
+        if ai and state == "ready":
+            hints["ready"] = (
+                "The voice test plays presets. To hear the AI voice, tick Monitor "
+                "(headphones) and talk."
+            )
         self.test_hint.setText(hints[state])
 
     def _build_bottom(self) -> QHBoxLayout:
@@ -332,6 +341,9 @@ class MainWindow(QMainWindow):
         self.preset_list.blockSignals(False)
         self.rename_button.setEnabled(not c.preset.builtin)
         self.delete_button.setEnabled(not c.preset.builtin)
+        # Presets never hold an AI voice; save classic settings, not AI mode.
+        self.save_button.setEnabled(not c.ai_active)
+        self.ai_panel.refresh()
 
         self._refresh_title()
         self.preset_description.setText(c.preset.description)
@@ -380,6 +392,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(container)
         layout.addWidget(self._effect_box(None, c.gate))
         for index, effect in enumerate(c.effects):
+            if effect.name == "ai_voice":
+                note = QLabel("AI Voice is on: its settings are in the AI Voice section below.")
+                note.setWordWrap(True)
+                layout.addWidget(note)
+                continue
             layout.addWidget(self._effect_box(index, effect))
         layout.addStretch(1)
         self.effects_area.setWidget(container)
@@ -398,6 +415,7 @@ class MainWindow(QMainWindow):
     def tick(self) -> None:
         self._update_voice_test()
         status = self.controller.status()
+        self.ai_panel.tick(status)
         self.input_meter.set_peak(status.input_peak)
         self.output_meter.set_peak(status.output_peak)
         if status.running:
@@ -513,6 +531,7 @@ class MainWindow(QMainWindow):
             self.hotkeys.close()
         self.poll_timer.stop()
         self.controller.stop()
+        self.controller.shutdown_ai()
         if self.tray is not None:
             self.tray.hide()
         QApplication.quit()

@@ -76,6 +76,13 @@ class EffectChain:
     def latency_samples(self) -> int:
         return sum(fx.latency_samples for fx in self._target_effects)
 
+    def uses(self, effect: Effect) -> bool:
+        """Whether the audio thread may still call ``effect`` (current, target,
+        or fading out). Only then is it safe to release its resources."""
+        return any(
+            fx is effect for fx in (*self._target_effects, *self._effects, *self._old_effects)
+        )
+
     # --- audio thread ------------------------------------------------------
 
     def reset(self) -> None:

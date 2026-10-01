@@ -115,3 +115,17 @@ def test_autostart_command_starts_minimized_with_clean():
     assert "--minimized" in command
     assert '--preset "Clean"' in command
     assert "-m timbrel" in command
+
+
+def test_ai_settings_round_trip(tmp_path):
+    path = tmp_path / "settings.json"
+    Settings(ai_voice="Fp231", ai_semitones=12.0, ai_index_rate=0.3).save(path)
+    loaded = Settings.load(path)
+    assert (loaded.ai_voice, loaded.ai_semitones, loaded.ai_index_rate) == ("Fp231", 12.0, 0.3)
+
+
+def test_bad_ai_settings_are_ignored(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"ai_voice": 5, "ai_semitones": "high", "ai_index_rate": True}))
+    loaded = Settings.load(path)
+    assert (loaded.ai_voice, loaded.ai_semitones, loaded.ai_index_rate) == (None, 0.0, 0.5)

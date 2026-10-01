@@ -9,7 +9,9 @@ engine and chain, which publish changes by reference swap.
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +21,7 @@ import numpy as np
 import sounddevice as sd
 
 from timbrel.core.chain import EffectChain
-from timbrel.core.effects import Effect, NoiseGate
+from timbrel.core.effects import EFFECTS, Effect, NoiseGate
 from timbrel.core.engine import DEFAULT_SAMPLE_RATE, Engine, EngineConfig
 from timbrel.platform import windows
 from timbrel.presets import Preset, PresetLibrary, preset_from_effects
@@ -82,6 +84,38 @@ class SoundDevicePlayer:
             return False
 
 
+AiLoader = Callable[[str, int], Effect]
+
+
+def load_ai_effect(name: str, block_size: int) -> Effect:
+    """Load an installed AI voice by name (slow; runs off the UI thread)."""
+    from timbrel.ai import list_voices, load_voice
+    from timbrel.ai.runtime import AiUnavailable
+
+    voices = {v.name: v for v in list_voices()}
+    if name not in voices:
+        raise AiUnavailable(f"The voice \u201c{name}\u201d isn't in the voices folder any more")
+    return load_voice(voices[name], DEFAULT_SAMPLE_RATE, block_size)
+
+
+def _installed_ai_voices() -> list[str]:
+    from timbrel.ai import list_voices
+
+    return [v.name for v in list_voices()]
+
+
+def _check_ai_runtime() -> str:
+    """Raises (with a user-facing reason) unless AI voice can run here."""
+    from timbrel.ai import ai_dir
+    from timbrel.ai.runtime import HUBERT_FILE, RMVPE_FILE, AiUnavailable, check_runtime
+
+    info = check_runtime()
+    missing = [f for f in (HUBERT_FILE, RMVPE_FILE) if not (ai_dir() / f).exists()]
+    if missing:
+        raise AiUnavailable(f"Base model files missing from {ai_dir()}: {', '.join(missing)}")
+    return info
+
+
 RETRY_SECONDS = 2.0  # how often a paused engine retries its devices
 STALL_POLLS = 3  # polls (~0.5 s apart) with no audio callbacks = device gone
 
@@ -99,6 +133,12 @@ class Status:
     input_peak: float
     output_peak: float
     monitor_note: str | None = None  # why monitoring isn't playing, if it should be
+    ai_voice: str | None = None  # AI voice in use
+    ai_loading: str | None = None  # AI voice being loaded
+    ai_error: str | None = None  # why the last AI voice couldn't load
+    ai_compute_ms: float = 0.0  # GPU time per 100 ms step
+    ai_boost_db: float = 0.0  # automatic input gain in use
+    ai_underruns: int = 0
 
 
 class Controller:
@@ -113,6 +153,9 @@ class Controller:
         rescan_devices: Callable[[], windows.WasapiDevices] | None = None,
         clock: Callable[[], float] | None = None,
         player: Player | None = None,
+        ai_loader: AiLoader | None = None,
+        ai_voices: Callable[[], list[str]] | None = None,
+        ai_check: Callable[[], str] | None = None,
     ) -> None:
         self.settings = settings
         self._settings_path = settings_path
@@ -146,6 +189,18 @@ class Controller:
         self.chain = self._new_chain(preset)
         self.chain.set_bypass(settings.bypass)
         self.listeners: list[Callable[[], None]] = []
+
+        self._ai_loader = ai_loader or load_ai_effect
+        self._ai_voices = ai_voices or _installed_ai_voices
+        self._ai_check = ai_check or _check_ai_runtime
+        self.ai_effect: Effect | None = None
+        self.ai_loading: str | None = None
+        self.ai_error: str | None = None
+        # Finished loads (name, effect, error), filled by loader threads.
+        self._ai_results: deque[tuple[str, Effect | None, str | None]] = deque()
+        self._ai_retired: list[Effect] = []
+        if settings.ai_voice:
+            self.set_ai_voice(settings.ai_voice)
 
     # --- helpers ------------------------------------------------------------
 
@@ -275,6 +330,7 @@ class Controller:
     def poll(self) -> None:
         """Call about twice a second from the UI thread. Detects a device that
         stopped delivering audio (unplugged) and retries a paused engine."""
+        self.poll_ai()
         if self._test_playing and not self._player.playing:
             self._end_test_playback()
         if self.engine is not None:
@@ -346,12 +402,17 @@ class Controller:
     def set_block_size(self, block_size: int) -> None:
         self.settings.block_size = block_size
         self._save()
-        # Effects preallocate per block size, so rebuild the chain.
+        # Effects preallocate per block size, so rebuild the chain (an AI
+        # voice is reloaded for the new size).
         live = self.snapshot("live")
         bypass = self.chain.bypassed
+        ai_voice = self.settings.ai_voice
+        self._drop_ai()
         self.chain = self._new_chain(live)
         self.chain.set_bypass(bypass)
         self.start()
+        if ai_voice:
+            self.set_ai_voice(ai_voice)
 
     def status(self) -> Status:
         engine = self.engine
@@ -369,6 +430,12 @@ class Controller:
             input_peak=stats.input_peak if stats and running else 0.0,
             output_peak=stats.output_peak if stats and running else 0.0,
             monitor_note=self.monitor_note if running else None,
+            ai_voice=self.settings.ai_voice if self.ai_effect is not None else None,
+            ai_loading=self.ai_loading,
+            ai_error=self.ai_error,
+            ai_compute_ms=getattr(self.ai_effect, "compute_ms", 0.0),
+            ai_boost_db=getattr(self.ai_effect, "input_gain_db", 0.0),
+            ai_underruns=getattr(self.ai_effect, "underruns", 0),
         )
 
     # --- presets and effects -------------------------------------------------
@@ -385,6 +452,7 @@ class Controller:
         preset = self.library.get(name)
         if preset is None:
             return
+        self._drop_ai()  # picking a preset switches back to classic effects
         bs = self.settings.block_size
         self.chain.set_effects(preset.build_effects(DEFAULT_SAMPLE_RATE, bs))
         self.chain.gate.set_params(**preset.gate_params())
@@ -406,7 +474,9 @@ class Controller:
         self.modified = True
 
     def snapshot(self, name: str) -> Preset:
-        return preset_from_effects(name, self.gate, self.effects, self.preset.description)
+        # AI voices depend on files outside the preset, so presets never hold one.
+        classic = [fx for fx in self.effects if fx.name in EFFECTS]
+        return preset_from_effects(name, self.gate, classic, self.preset.description)
 
     def save_preset_as(self, name: str, overwrite: bool = False) -> Preset:
         saved = self.library.save(self.snapshot(name), overwrite=overwrite)
@@ -451,6 +521,114 @@ class Controller:
         self._autostart(enabled)
         self.settings.start_with_windows = enabled
         self._save()
+
+    # --- AI voice (experimental) ---------------------------------------------
+
+    @property
+    def ai_active(self) -> bool:
+        return self.ai_effect is not None
+
+    def set_ai_voice(self, name: str | None) -> None:
+        """Switch to an AI voice (loaded in the background, then crossfaded
+        in) or back to the current preset with None."""
+        if name is None:
+            self._drop_ai()
+            if any(fx.name not in EFFECTS for fx in self.chain.effects):
+                self.chain.set_effects(self.preset.build_effects(DEFAULT_SAMPLE_RATE, self._bs))
+                self.chain.gate.set_params(**self.preset.gate_params())
+            self._save()
+            self._notify()
+            return
+        self.settings.ai_voice = name
+        self.ai_loading = name
+        self.ai_error = None
+        self._save()
+        block_size = self._bs
+
+        def load() -> None:
+            try:
+                self._ai_results.append((name, self._ai_loader(name, block_size), None))
+            except Exception as exc:  # noqa: BLE001 - shown to the user, app keeps running
+                self._ai_results.append((name, None, str(exc) or type(exc).__name__))
+
+        threading.Thread(target=load, name="timbrel-ai-load", daemon=True).start()
+        self._notify()
+
+    @property
+    def _bs(self) -> int:
+        return self.settings.block_size
+
+    def ai_voice_names(self) -> list[str]:
+        return self._ai_voices()
+
+    def check_ai(self) -> str:
+        """Slow (imports onnxruntime); call off the UI thread. Raises with a
+        user-facing reason if AI voice can't run on this machine."""
+        return self._ai_check()
+
+    def set_ai_param(self, name: str, value: float) -> None:
+        if name == "semitones":
+            self.settings.ai_semitones = value
+        elif name == "index_rate":
+            self.settings.ai_index_rate = value
+        else:
+            raise ValueError(f"unknown AI parameter {name!r}")
+        if self.ai_effect is not None:
+            self.ai_effect.set_params(**{name: value})
+        self._save()
+
+    def poll_ai(self) -> None:
+        """Install a voice that finished loading; release retired ones once
+        the audio thread has faded away from them."""
+        while self._ai_results:
+            name, effect, error = self._ai_results.popleft()
+            if name != self.ai_loading:  # superseded while loading
+                if effect is not None:
+                    self._ai_retired.append(effect)
+            elif effect is None:
+                self.ai_loading = None
+                self.ai_error = error
+                self.settings.ai_voice = None
+                self._save()
+                self._notify()
+            else:
+                self._install_ai(effect)
+        still_used = []
+        for effect in self._ai_retired:
+            if self.chain.uses(effect):
+                still_used.append(effect)
+            else:
+                getattr(effect, "close", lambda: None)()
+        self._ai_retired = still_used
+
+    def _install_ai(self, effect: Effect) -> None:
+        from timbrel.ai import AI_GATE
+
+        effect.set_params(
+            semitones=self.settings.ai_semitones, index_rate=self.settings.ai_index_rate
+        )
+        if self.ai_effect is not None:
+            self._ai_retired.append(self.ai_effect)
+        self.ai_effect = effect
+        self.ai_loading = None
+        self.chain.set_effects([effect])
+        self.chain.gate.set_params(**AI_GATE)
+        self._notify()
+
+    def _drop_ai(self) -> None:
+        """Leave AI mode (the caller puts classic effects in the chain)."""
+        self.ai_loading = None  # a load still running is discarded when it lands
+        self.settings.ai_voice = None
+        if self.ai_effect is not None:
+            self._ai_retired.append(self.ai_effect)
+            self.ai_effect = None
+
+    def shutdown_ai(self) -> None:
+        """Stop AI worker threads (on quit, after the engine has stopped)."""
+        for effect in [*self._ai_retired, self.ai_effect]:
+            if effect is not None:
+                getattr(effect, "close", lambda: None)()
+        self._ai_retired = []
 
     # --- voice test: record a few seconds, play back with effects -------------
 

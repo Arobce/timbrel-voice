@@ -92,6 +92,8 @@ def make_controller(tmp_path, devices=DEVICES, settings=None, autostart=None, pl
         engine_factory=FakeEngine,
         autostart=autostart or (lambda enabled: None),
         player=player or FakePlayer(),
+        ai_voices=lambda: [],
+        ai_check=lambda: "test GPU",
     )
 
 
@@ -446,3 +448,194 @@ def test_silent_monitor_is_restarted(tmp_path):
     assert c.engine is not first  # restarted
     assert c.engine.running
     assert c.error is None
+
+
+# --- AI voice in the controller (fake effect; no GPU) ------------------------------
+
+import time as _time  # noqa: E402
+
+from timbrel.core.effects.base import Effect  # noqa: E402
+from timbrel.core.params import ParamSpec  # noqa: E402
+
+
+class FakeAi(Effect):
+    name = "ai_voice"
+    PARAMS = {"semitones": ParamSpec(0.0, -24.0, 24.0), "index_rate": ParamSpec(0.5, 0.0, 1.0)}
+
+    def __init__(self, sample_rate, block_size, voice="v"):
+        super().__init__(sample_rate, block_size)
+        self.voice = voice
+        self.closed = False
+        self.compute_ms, self.input_gain_db, self.underruns = 40.0, 12.0, 0
+
+    def _apply_params(self, params):
+        self.applied = dict(params)
+
+    def _process(self, block):
+        return block
+
+    def reset(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def make_ai_controller(tmp_path, fail=None, settings=None):
+    loaded = []
+
+    def loader(name, block_size):
+        if fail:
+            raise RuntimeError(fail)
+        fx = FakeAi(48000, block_size, name)
+        loaded.append(fx)
+        return fx
+
+    wasapi = windows.wasapi_devices(DEVICES, HOSTAPIS)
+    c = Controller(
+        settings or Settings(),
+        tmp_path / "settings.json",
+        PresetLibrary(tmp_path / "presets"),
+        query_devices=lambda: wasapi,
+        engine_factory=FakeEngine,
+        autostart=lambda enabled: None,
+        player=FakePlayer(),
+        ai_loader=loader,
+        ai_voices=lambda: ["Fp231", "Mp311"],
+        ai_check=lambda: "test GPU",
+    )
+    return c, loaded
+
+
+def wait_for_ai(c):
+    deadline = _time.monotonic() + 3
+    while c.ai_loading and _time.monotonic() < deadline:
+        c.poll_ai()
+        _time.sleep(0.01)
+    c.poll_ai()
+
+
+def finish_fades(c):
+    for _ in range(10):  # let the chain's crossfades complete
+        c.chain.process(np.zeros(256, np.float32))
+
+
+def test_ai_voice_loads_in_background_then_replaces_the_preset(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.start()
+    c.set_ai_voice("Fp231")
+    assert c.ai_loading == "Fp231"
+    assert not c.ai_active  # the classic preset keeps playing meanwhile
+    wait_for_ai(c)
+    assert c.ai_active
+    assert c.chain.effects == (loaded[0],)
+    assert c.gate.params["threshold_db"] == -55  # the AI gate
+    status = c.status()
+    assert status.ai_voice == "Fp231"
+    assert status.ai_compute_ms == 40.0
+    assert Settings.load(tmp_path / "settings.json").ai_voice == "Fp231"
+
+
+def test_ai_settings_are_applied_and_saved(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_param("semitones", 12)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    c.set_ai_param("index_rate", 0.3)
+    c.chain.process(np.zeros(256, np.float32))
+    assert loaded[0].params == {"semitones": 12.0, "index_rate": 0.3}
+    saved = Settings.load(tmp_path / "settings.json")
+    assert (saved.ai_semitones, saved.ai_index_rate) == (12.0, 0.3)
+
+
+def test_failed_load_shows_error_and_stays_classic(tmp_path):
+    c, _ = make_ai_controller(tmp_path, fail="AI voice needs an NVIDIA GPU")
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    assert not c.ai_active
+    assert "NVIDIA" in c.status().ai_error
+    assert [fx.name for fx in c.effects] == ["eq", "compressor"]  # still Clean
+    assert Settings.load(tmp_path / "settings.json").ai_voice is None
+
+
+def test_turning_ai_off_restores_the_preset_and_releases_the_voice(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    finish_fades(c)  # the AI voice is now playing
+    c.set_ai_voice(None)
+    assert [fx.name for fx in c.chain.effects] == ["eq", "compressor"]
+    assert c.gate.params["threshold_db"] == -50  # Clean's gate again
+    c.poll_ai()
+    assert not loaded[0].closed  # still fading out in the chain
+    finish_fades(c)
+    c.poll_ai()
+    assert loaded[0].closed
+
+
+def test_picking_a_preset_leaves_ai_mode(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    finish_fades(c)
+    c.select_preset("Robot")
+    assert not c.ai_active
+    assert [fx.name for fx in c.effects] == ["robot", "eq"]
+    finish_fades(c)
+    c.poll_ai()
+    assert loaded[0].closed
+
+
+def test_switching_voice_mid_load_keeps_only_the_latest(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_voice("First")
+    c.set_ai_voice("Second")
+    wait_for_ai(c)
+    _time.sleep(0.1)
+    c.poll_ai()
+    assert c.chain.effects[0].voice == "Second"
+    first = next(fx for fx in loaded if fx.voice == "First")
+    assert first.closed
+
+
+def test_presets_never_save_the_ai_voice(tmp_path):
+    c, _ = make_ai_controller(tmp_path)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    assert all(e.type != "ai_voice" for e in c.snapshot("Mine").effects)
+
+
+def test_ai_voice_restored_on_startup(tmp_path):
+    c, loaded = make_ai_controller(tmp_path, settings=Settings(ai_voice="Fp231"))
+    wait_for_ai(c)
+    assert c.ai_active
+    assert loaded[0].voice == "Fp231"
+
+
+def test_block_size_change_reloads_the_ai_voice(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.start()
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    c.set_block_size(512)
+    wait_for_ai(c)
+    assert c.ai_active
+    assert loaded[-1].block_size == 512
+    assert c.chain.effects == (loaded[-1],)
+
+
+def test_shutdown_closes_ai_workers(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    c.shutdown_ai()
+    assert loaded[0].closed
+
+
+def test_ai_voice_that_never_played_is_released_at_once(tmp_path):
+    c, loaded = make_ai_controller(tmp_path)
+    c.set_ai_voice("Fp231")
+    wait_for_ai(c)
+    c.set_ai_voice(None)  # before the audio thread ever used it
+    c.poll_ai()
+    assert loaded[0].closed

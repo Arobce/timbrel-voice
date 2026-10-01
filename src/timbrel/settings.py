@@ -26,6 +26,10 @@ class Settings:
     bypass: bool = False
     start_with_windows: bool = False
     first_run_done: bool = False
+    # AI Voice (experimental): the voice in use (None = off) and its settings.
+    ai_voice: str | None = None
+    ai_semitones: float = 0.0
+    ai_index_rate: float = 0.5
     # action -> hotkey, e.g. {"bypass": "f9"}; empty string = unbound
     hotkeys: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_HOTKEYS))
 
@@ -55,7 +59,9 @@ class Settings:
 
 
 def _valid(name: str, value: Any) -> bool:
-    if name in ("input_device", "output_device", "monitor_device"):
+    if name in ("ai_semitones", "ai_index_rate"):
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if name in ("input_device", "output_device", "monitor_device", "ai_voice"):
         return value is None or isinstance(value, str)
     if name == "preset":
         return isinstance(value, str) and bool(value)
