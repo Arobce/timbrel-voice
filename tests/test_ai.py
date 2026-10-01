@@ -10,6 +10,8 @@ from scipy.signal import resample_poly
 from timbrel.ai import VoiceFile, list_voices
 from timbrel.ai.runtime import (
     GEN_FRAMES,
+    PITCH_TAIL,
+    RvcConverter,
     coarse_pitch,
     decode_f0,
     log_mel,
@@ -32,7 +34,7 @@ class IdentityConverter:
         self.index_rate = 0.5
         self.calls = 0
 
-    def convert(self, audio16, semitones):
+    def convert(self, audio16, semitones, advance16=None):
         self.calls += 1
         # Like the real pipeline: HuBERT's 20 ms frames (x2 -> 100 fps) cover
         # 2 s minus the last 20 ms.
@@ -105,6 +107,45 @@ def test_smooth_f0_fixes_flicker_and_octave_jumps():
     assert np.all(silent == 0)
 
 
+class LocalPitchModel:
+    """Stands in for RMVPE: each frame's pitch bin follows its own mel column,
+    so incremental and from-scratch runs must agree exactly."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, feeds):
+        self.calls += 1
+        window = feeds["input"]
+        assert window.shape == (1, 128, PITCH_TAIL)  # fixed shape (CUDA graph)
+        bins = (np.abs(window[0].mean(axis=0)) * 1000).astype(int) % 300 + 30
+        out = np.zeros((1, PITCH_TAIL, 360), np.float32)
+        out[0, np.arange(PITCH_TAIL), bins] = 1.0
+        return out
+
+
+def test_incremental_pitch_matches_from_scratch():
+    class Base:
+        rmvpe = LocalPitchModel()
+
+    audio = noise(seconds=4.0)[::3].copy()  # 16 kHz
+    window, step = 32000, 1600
+    streaming = RvcConverter(Base(), voice=None)
+    fresh = RvcConverter(Base(), voice=None)
+    for i, end in enumerate(range(window, len(audio), step)):
+        w = audio[end - window : end]
+        got = streaming.pitch(w, None if i == 0 else step)
+        # The first frames differ by design: from scratch they see the STFT's
+        # mirrored padding; streaming kept their values from real audio.
+        edge = 512 // 160 + 1 + 2  # padding reach + median smoothing
+        np.testing.assert_array_equal(got[edge:], fresh.pitch(w)[edge:])
+        fresh._salience = None
+    calls = Base.rmvpe.calls
+    streaming.pitch(audio[-window - step : -step], None)
+    streaming.pitch(audio[-window:], step)
+    assert Base.rmvpe.calls - calls == 4 + 1  # from scratch: 4 runs; a step: 1
+
+
 # --- streaming -----------------------------------------------------------------------
 
 
@@ -154,7 +195,7 @@ def test_semitones_reach_the_converter():
     seen = []
 
     class Spy(IdentityConverter):
-        def convert(self, audio16, semitones):
+        def convert(self, audio16, semitones, advance16=None):
             seen.append(semitones)
             return super().convert(audio16, semitones)
 
@@ -162,6 +203,22 @@ def test_semitones_reach_the_converter():
     p.semitones = 7.0
     p.process(np.zeros(HOP, np.float32))
     assert seen == [7.0]
+
+
+def test_converter_is_told_how_far_the_window_moved():
+    seen = []
+
+    class Spy(IdentityConverter):
+        def convert(self, audio16, semitones, advance16=None):
+            seen.append(advance16)
+            return super().convert(audio16, semitones)
+
+    p = StreamProcessor(Spy())
+    for _ in range(3):
+        p.process(np.zeros(HOP, np.float32))
+    p.reset()  # the window's history is gone: the converter must start over
+    p.process(np.zeros(HOP, np.float32))
+    assert seen == [None, HOP // 3, HOP // 3, None]
 
 
 # --- ring buffer and the effect ---------------------------------------------------------

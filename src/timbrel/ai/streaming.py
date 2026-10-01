@@ -23,8 +23,11 @@ SPEECH_FLOOR = 10 ** (-70 / 20)  # below this a block is silence (the gate close
 
 
 class Converter(Protocol):
-    def convert(self, audio16: np.ndarray, semitones: float) -> np.ndarray:
-        """2 s of 16 kHz audio -> the same span at 40 kHz in the target voice."""
+    def convert(
+        self, audio16: np.ndarray, semitones: float, advance16: int | None = None
+    ) -> np.ndarray:
+        """2 s of 16 kHz audio -> the same span at 40 kHz in the target voice.
+        ``advance16`` is how far the window moved since the last call, or None."""
         ...
 
 
@@ -60,6 +63,7 @@ class StreamProcessor:
         self.prev_tail = np.zeros(self.cf, np.float32)
         self.level: float | None = None  # tracked speech RMS for the input gain
         self.gain_db = 0.0
+        self.advance16: int | None = None  # unknown until the first step
 
     def _input_gain(self, block: np.ndarray) -> float:
         """Bring speech to a steady level: quiet input loses voicing in the
@@ -79,7 +83,8 @@ class StreamProcessor:
         np.clip(block * gain, -1.0, 1.0, out=self.context[-n:])
 
         audio16 = resample_poly(self.context, 1, 3).astype(np.float32)
-        out40 = self.converter.convert(audio16, self.semitones)
+        out40 = self.converter.convert(audio16, self.semitones, self.advance16)
+        self.advance16 = n // 3 if n % 3 == 0 else None
         span = self.hop + self.cf + self.search + self.lookahead
         tail40 = out40[-(span * 5 // 6 + 64) :]
         out48 = resample_poly(tail40, 6, 5).astype(np.float32)
