@@ -147,6 +147,7 @@ def _load_cuda_dlls() -> None:
         return
     import onnxruntime as ort
 
+    ort.set_default_logger_severity(3)  # errors only; its warnings are noise here
     try:
         ort.preload_dlls()
     except Exception:  # noqa: BLE001 - older builds / system CUDA installs
